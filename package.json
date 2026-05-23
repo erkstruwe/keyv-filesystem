@@ -30,6 +30,9 @@
     "url": "https://github.com/erkstruwe/keyv-filesystem/issues"
   },
   "homepage": "https://github.com/erkstruwe/keyv-filesystem#readme",
+  "engines": {
+    "node": ">=16.8.0"
+  },
   "devDependencies": {
     "@keyv/serialize": "^1.1.1",
     "@keyv/test-suite": "^2.1.1",
