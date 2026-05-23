@@ -90,13 +90,13 @@ describe("Store operations", () => {
     try {
       await store.setMany([
         { key: "a", value: Buffer.from("va") },
-        { key: "b", value: Buffer.from("vb"), ttl: 5 },
+        { key: "b", value: Buffer.from("vb"), ttl: 40 },
       ]);
 
       expect((await store.get<Buffer>("a"))?.toString()).toBe("va");
       expect((await store.get<Buffer>("b"))?.toString()).toBe("vb");
 
-      await new Promise((resolve) => setTimeout(resolve, 20));
+      await new Promise((resolve) => setTimeout(resolve, 80));
 
       const results = await store.hasMany(["a", "b", "missing"]);
       expect(results).toEqual([true, false, false]);
