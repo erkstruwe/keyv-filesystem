@@ -7,8 +7,9 @@
   "scripts": {
     "build": "tsc",
     "format": "prettier --write .",
+    "format:check": "prettier --check .",
     "test": "tsc && rimraf ./node_modules/.cache && vitest run",
-    "preversion": "npm test",
+    "preversion": "npm run format:check && npm test",
     "postversion": "git add --all && git push origin main --tags"
   },
   "files": [
