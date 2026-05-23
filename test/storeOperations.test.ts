@@ -164,8 +164,11 @@ describe("Store operations", () => {
       startedAt: number;
       endedAt: number;
     }> = [];
-    const errors: Array<{ startedAt: number; durationMs: number; error: unknown }> =
-      [];
+    const errors: Array<{
+      startedAt: number;
+      durationMs: number;
+      error: unknown;
+    }> = [];
 
     store.on("sweep:start", (event) => {
       starts.push(event);
