@@ -1,6 +1,6 @@
 {
   "name": "keyv-filesystem",
-  "version": "1.0.0-rc.2",
+  "version": "1.0.0-rc.3",
   "description": "Filesystem storage adapter for Keyv, optimized for binary data, using one file per item.",
   "main": "lib/index.js",
   "types": "./lib/index.d.ts",
