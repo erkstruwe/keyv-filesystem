@@ -12,8 +12,7 @@ export type DefaultSetValue = Buffer | Readable | WebReadableStream;
 
 type Serializer<SetValue> = (value: SetValue) => Readable | Promise<Readable>;
 
-type Deserializer<GetValue> =
-  (value: Readable) => GetValue | Promise<GetValue>;
+type Deserializer<GetValue> = (value: Readable) => GetValue | Promise<GetValue>;
 
 export interface Options<SetValue = DefaultSetValue, GetValue = Buffer> {
   /** Keyv adapter dialect hint used by Keyv internals. */
@@ -170,10 +169,10 @@ async function fsyncDirectory(dirPath: string) {
   }
 }
 
-export class KeyvFilesystem<
-  SetValue = DefaultSetValue,
-  GetValue = Buffer,
-> extends EventEmitter implements KeyvStoreAdapter {
+export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
+  extends EventEmitter
+  implements KeyvStoreAdapter
+{
   public ttlSupport = true;
 
   public namespace?: string;
@@ -226,10 +225,7 @@ export class KeyvFilesystem<
       ? `${namespaceBaseName}__${keyBaseName}`
       : keyBaseName;
 
-    return path.join(
-      this.directory,
-      `${fileBaseName}${this.opts.extension}`,
-    );
+    return path.join(this.directory, `${fileBaseName}${this.opts.extension}`);
   }
 
   private decodeFileName(fileName: string): string | undefined {
@@ -307,9 +303,7 @@ export class KeyvFilesystem<
     }
   }
 
-  public async get<Value = GetValue>(
-    key: string,
-  ): Promise<Value | undefined> {
+  public async get<Value = GetValue>(key: string): Promise<Value | undefined> {
     const entry = this.entryPath(key);
     const stat = await this.statWithMiss(entry);
     if (!stat) {

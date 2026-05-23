@@ -54,10 +54,7 @@ await keyv.set("as-node-readable", readableFromFile);
 
 // 3) Web ReadableStream
 const fileHandle = await open("./assets/archive.bin", "r");
-await keyv.set(
-  "as-web-readable-stream",
-  fileHandle.readableWebStream(),
-);
+await keyv.set("as-web-readable-stream", fileHandle.readableWebStream());
 await fileHandle.close();
 ```
 
