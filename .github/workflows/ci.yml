@@ -1,9 +1,8 @@
 name: CI
 on:
   push:
-    branches: [main]
-    paths-ignore:
-      - "README.md"
+    tags:
+      - "v*"
 jobs:
   test:
     runs-on: ubuntu-latest
