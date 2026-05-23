@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { Readable } from "stream";
 import { ReadableStream } from "stream/web";
 import { randomTestPath, streamToBuffer } from "./helpers.js";
-import KeyvFilesystem from "../lib/index.js";
+import KeyvFilesystem from "../src/index.ts";
 
 describe("Serialization behavior", () => {
   it("default deserializer returns Buffer", async () => {

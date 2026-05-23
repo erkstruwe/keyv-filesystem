@@ -1,8 +1,17 @@
 import { describe, it, expect, vi } from "vitest";
 import { promises as fsp } from "fs";
+import path from "path";
 import Keyv from "keyv";
-import KeyvFilesystem from "../lib/index.js";
+import KeyvFilesystem from "../src/index.ts";
 import { keyvDeserialize, keyvSerialize, randomTestPath } from "./helpers.js";
+
+const INDEX_FILE_NAME = ".keyv-filesystem-index.sqlite";
+
+function encodedFileName(key: string, expiresAt: number | "never"): string {
+  const identity = `k_${Buffer.from(key).toString("base64url")}`;
+  const token = expiresAt === "never" ? "never" : String(expiresAt);
+  return `${identity}__exp_${token}.bin`;
+}
 
 describe("Store operations", () => {
   it("sets ttl metadata before rename and avoids post-rename utimes", async () => {
@@ -127,6 +136,100 @@ describe("Store operations", () => {
       expect(second).toBe(1);
       expect(await store.get("soon-expire")).toBeUndefined();
     } finally {
+      await store.disconnect();
+    }
+  });
+
+  it("supports callback-based expiredCheckDelay with sweep stats", async () => {
+    const dir = randomTestPath("adaptive-expire-delay");
+    const expiredCheckDelay = vi.fn(() => 5);
+    const store = new KeyvFilesystem({ path: dir, expiredCheckDelay });
+
+    try {
+      await store.set("soon-expire", Buffer.from("v"), 5);
+      await new Promise((resolve) => setTimeout(resolve, 80));
+
+      const calls = expiredCheckDelay.mock.calls.map(
+        (entry) =>
+          entry[0] as
+            | {
+                totalFiles: number;
+                namespaceFiles: number;
+                deletedFiles: number;
+                durationMs: number;
+              }
+            | undefined,
+      );
+
+      expect(calls.length).toBeGreaterThan(1);
+      expect(calls[0]).toBeUndefined();
+      expect(calls.some((stats) => (stats?.deletedFiles ?? 0) >= 1)).toBe(true);
+
+      const files = await fsp.readdir(dir);
+      expect(files.length).toBe(0);
+    } finally {
+      await store.disconnect();
+    }
+  });
+
+  it("creates sqlite index and bootstraps from existing files", async () => {
+    const dir = randomTestPath("sqlite-index-bootstrap");
+    await fsp.mkdir(dir, { recursive: true });
+    await fsp.writeFile(
+      path.join(dir, encodedFileName("stale", Date.now() - 1_000)),
+      Buffer.from("old"),
+    );
+    await fsp.writeFile(
+      path.join(dir, encodedFileName("alive", Date.now() + 60_000)),
+      Buffer.from("new"),
+    );
+
+    const store = new KeyvFilesystem({
+      path: dir,
+      useIndexFile: true,
+      expiredCheckDelay: 60_000,
+    });
+
+    try {
+      const startedAt = Date.now();
+      while (Date.now() - startedAt < 2_000) {
+        if ((await store.get<Buffer>("stale")) === undefined) {
+          break;
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+
+      expect(await store.get("stale")).toBeUndefined();
+      expect((await store.get<Buffer>("alive"))?.toString()).toBe("new");
+      await expect(
+        fsp.stat(path.join(dir, INDEX_FILE_NAME)),
+      ).resolves.toBeTruthy();
+    } finally {
+      await store.disconnect();
+    }
+  });
+
+  it("uses sqlite index during regular clearExpire sweeps", async () => {
+    const dir = randomTestPath("sqlite-index-sweep");
+    const store = new KeyvFilesystem({
+      path: dir,
+      useIndexFile: true,
+      expiredCheckDelay: 60_000,
+    });
+
+    const opendirSpy = vi.spyOn(fsp, "opendir");
+    try {
+      await store.set("expires", Buffer.from("v"), 5);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      opendirSpy.mockClear();
+
+      const deleted = await store.clearExpire();
+      expect(deleted).toBe(1);
+      expect(opendirSpy).not.toHaveBeenCalled();
+    } finally {
+      opendirSpy.mockRestore();
       await store.disconnect();
     }
   });

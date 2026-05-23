@@ -2,10 +2,17 @@ import { defaultDeserialize, defaultSerialize } from "@keyv/serialize";
 import path from "path";
 import { Readable } from "stream";
 
-export const TEST_ROOT = path.join("node_modules", ".cache", "keyv-filesystem-tests");
+export const TEST_ROOT = path.join(
+  "node_modules",
+  ".cache",
+  "keyv-filesystem-tests",
+);
 
 export function randomTestPath(prefix: string): string {
-  return path.join(TEST_ROOT, `${prefix}-${Math.random().toString(36).slice(2)}`);
+  return path.join(
+    TEST_ROOT,
+    `${prefix}-${Math.random().toString(36).slice(2)}`,
+  );
 }
 
 export async function streamToBuffer(stream: Readable): Promise<Buffer> {

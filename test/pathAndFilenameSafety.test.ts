@@ -1,7 +1,7 @@
 import { expect, it, describe } from "vitest";
 import { promises as fsp } from "fs";
 import path from "path";
-import KeyvFilesystem from "../lib/index.js";
+import KeyvFilesystem from "../src/index.ts";
 import { randomTestPath } from "./helpers.js";
 
 describe("Path and filename safety", () => {

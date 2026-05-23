@@ -1,7 +1,7 @@
 import keyvTestSuite, { keyvIteratorTests } from "@keyv/test-suite";
 import Keyv from "keyv";
 import * as test from "vitest";
-import KeyvFilesystem from "../lib/index.js";
+import KeyvFilesystem from "../src/index.ts";
 import { keyvDeserialize, keyvSerialize, randomTestPath } from "./helpers.js";
 
 const storeOne = () =>
