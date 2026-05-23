@@ -786,9 +786,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
           value,
         })),
         new Promise<{ type: "error"; error: unknown }>((resolve) => {
-          readable.once("error", (error) =>
-            resolve({ type: "error", error }),
-          );
+          readable.once("error", (error) => resolve({ type: "error", error }));
         }),
       ]);
 
