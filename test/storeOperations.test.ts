@@ -140,6 +140,66 @@ describe("Store operations", () => {
     }
   });
 
+  it("emits sweep lifecycle events for expired deletions", async () => {
+    const dir = randomTestPath("clear-expire-events");
+    const store = new KeyvFilesystem({ path: dir, expiredCheckDelay: 60_000 });
+
+    const starts: Array<{
+      startedAt: number;
+      useIndexFile: boolean;
+      namespace: string | undefined;
+    }> = [];
+    const fileDeletes: Array<{
+      identity: string;
+      key: string | undefined;
+      fileName: string;
+      expiresAt: number | undefined;
+      reason: "expired";
+    }> = [];
+    const ends: Array<{
+      totalFiles: number;
+      namespaceFiles: number;
+      deletedFiles: number;
+      durationMs: number;
+      startedAt: number;
+      endedAt: number;
+    }> = [];
+    const errors: Array<{ startedAt: number; durationMs: number; error: unknown }> =
+      [];
+
+    store.on("sweep:start", (event) => {
+      starts.push(event);
+    });
+    store.on("sweep:fileDeleted", (event) => {
+      fileDeletes.push(event);
+    });
+    store.on("sweep:end", (event) => {
+      ends.push(event);
+    });
+    store.on("sweep:error", (event) => {
+      errors.push(event);
+    });
+
+    try {
+      await store.set("soon-expire", Buffer.from("v"), 5);
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      expect(await store.clearExpire()).toBe(1);
+
+      expect(starts).toHaveLength(1);
+      expect(fileDeletes).toHaveLength(1);
+      expect(fileDeletes[0]?.key).toBe("soon-expire");
+      expect(fileDeletes[0]?.reason).toBe("expired");
+      expect(ends).toHaveLength(1);
+      expect(ends[0]?.deletedFiles).toBe(1);
+      expect(ends[0]?.startedAt).toBe(starts[0]?.startedAt);
+      expect(ends[0]?.endedAt).toBeGreaterThanOrEqual(ends[0]?.startedAt ?? 0);
+      expect(errors).toHaveLength(0);
+    } finally {
+      await store.disconnect();
+    }
+  });
+
   it("supports callback-based expiredCheckDelay with sweep stats", async () => {
     const dir = randomTestPath("adaptive-expire-delay");
     const expiredCheckDelay = vi.fn(() => 5);

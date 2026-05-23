@@ -1,6 +1,9 @@
 import { describe, it, expect, vi } from "vitest";
 import { Readable } from "stream";
 import { ReadableStream } from "stream/web";
+import { promises as fsp } from "fs";
+import path from "path";
+import Keyv from "keyv";
 import { randomTestPath, streamToBuffer } from "./helpers.js";
 import KeyvFilesystem from "../src/index.ts";
 
@@ -85,6 +88,32 @@ describe("Serialization behavior", () => {
         "Default serializer only accepts Buffer, Readable, or ReadableStream",
       );
     } finally {
+      await store.disconnect();
+    }
+  });
+
+  it("stores Readable payload bytes when Keyv serialization is disabled", async () => {
+    const dir = randomTestPath("keyv-readable-raw");
+    const store = new KeyvFilesystem({ path: dir, expiredCheckDelay: 60_000 });
+    const keyv = new Keyv<Buffer>({
+      store,
+      serialize: undefined,
+      deserialize: undefined,
+    });
+
+    try {
+      await keyv.set("stream", Readable.from([Buffer.from("hello "), "keyv"]));
+
+      const value = await keyv.get("stream");
+      expect(Buffer.isBuffer(value)).toBe(true);
+      expect((value as Buffer).toString("utf8")).toBe("hello keyv");
+
+      const files = await fsp.readdir(dir);
+      expect(files.length).toBe(1);
+      const stored = await fsp.readFile(path.join(dir, files[0]!));
+      expect(stored.toString("utf8")).toBe("hello keyv");
+    } finally {
+      await keyv.disconnect();
       await store.disconnect();
     }
   });

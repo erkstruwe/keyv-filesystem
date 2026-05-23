@@ -15,6 +15,11 @@ type Serializer<SetValue> = (value: SetValue) => Readable | Promise<Readable>;
 
 type Deserializer<GetValue> = (value: Readable) => GetValue | Promise<GetValue>;
 
+type KeyvEnvelope<Value> = {
+  value: Value;
+  expires?: number;
+};
+
 export interface ExpireSweepStats {
   /** Number of regular files currently found in the storage directory. */
   totalFiles: number;
@@ -24,6 +29,33 @@ export interface ExpireSweepStats {
   deletedFiles: number;
   /** Sweep wall-clock runtime in milliseconds. */
   durationMs: number;
+}
+
+export type ExpireSweepDeleteReason = "expired";
+
+export interface ExpireSweepStartEvent {
+  startedAt: number;
+  useIndexFile: boolean;
+  namespace: string | undefined;
+}
+
+export interface ExpireSweepFileDeletedEvent {
+  identity: string;
+  key: string | undefined;
+  fileName: string;
+  expiresAt: number | undefined;
+  reason: ExpireSweepDeleteReason;
+}
+
+export interface ExpireSweepEndEvent extends ExpireSweepStats {
+  startedAt: number;
+  endedAt: number;
+}
+
+export interface ExpireSweepErrorEvent {
+  startedAt: number;
+  durationMs: number;
+  error: unknown;
 }
 
 export type ExpiredCheckDelayResolver = (
@@ -106,6 +138,14 @@ function isNodeReadable(value: unknown): value is Readable {
 
 function isWebReadableStream(value: unknown): value is WebReadableStream {
   return value instanceof WebReadableStream;
+}
+
+function isKeyvEnvelope<Value>(value: unknown): value is KeyvEnvelope<Value> {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  return "value" in value;
 }
 
 function defaultReadableSerializer(value: DefaultSetValue): Readable {
@@ -272,6 +312,8 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   private gcInFlight?: Promise<ExpireSweepStats>;
 
   private lastExpireSweep?: ExpireSweepStats;
+
+  private keyvEnvelopeMode = false;
 
   constructor(options: KeyvFilesystemOptions<SetValue, GetValue>) {
     super();
@@ -752,7 +794,15 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
 
     const readable = fs.createReadStream(entry);
     try {
-      return (await this.opts.deserialize(readable)) as Value;
+      const deserialized = await this.opts.deserialize(readable);
+      if (this.keyvEnvelopeMode) {
+        return {
+          value: deserialized,
+          expires: indexed.expiresAt,
+        } as Value;
+      }
+
+      return deserialized as Value;
     } catch (error) {
       readable.destroy();
       if (isNodeErrno(error) && error.code === "ENOENT") {
@@ -789,7 +839,13 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     const fileName = this.fileNameFromIdentity(identity, expiresAt);
     const entry = path.join(this.directory, fileName);
 
-    const payload = await this.opts.serialize(value);
+    let valueToSerialize = value as unknown;
+    if (isKeyvEnvelope<SetValue>(value)) {
+      this.keyvEnvelopeMode = true;
+      valueToSerialize = value.value;
+    }
+
+    const payload = await this.opts.serialize(valueToSerialize as SetValue);
     if (this.opts.useIndexFile) {
       this.indexUpsert(identity, fileName, expiresAt);
     } else {
@@ -940,108 +996,168 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     }
   }
 
-  private async runExpireSweep(): Promise<ExpireSweepStats> {
-    if (this.opts.useIndexFile) {
-      await this.ensureIndexDatabase();
-      const db = this.requireIndexDb();
-      const startedAt = Date.now();
-      const now = Date.now();
-      const pattern = this.namespaceIdentityPattern();
-      const totalFiles = (
-        db.prepare(`SELECT COUNT(*) as count FROM entries`).get() as {
-          count: number;
-        }
-      ).count;
-      const namespaceFiles = (
-        db
-          .prepare(
-            `SELECT COUNT(*) as count FROM entries WHERE identity LIKE ?`,
-          )
-          .get(pattern) as { count: number }
-      ).count;
-      let deleted = 0;
+  private emitSweepStart(startedAt: number) {
+    const event: ExpireSweepStartEvent = {
+      startedAt,
+      useIndexFile: this.opts.useIndexFile,
+      namespace: this.namespace,
+    };
+    this.emit("sweep:start", event);
+  }
 
-      const expiredRows = db
-        .prepare(
-          `
-          SELECT identity, file_name as fileName
+  private emitSweepFileDeleted(event: ExpireSweepFileDeletedEvent) {
+    this.emit("sweep:fileDeleted", event);
+  }
+
+  private emitSweepEnd(startedAt: number, stats: ExpireSweepStats) {
+    const endedAt = startedAt + stats.durationMs;
+    const event: ExpireSweepEndEvent = {
+      ...stats,
+      startedAt,
+      endedAt,
+    };
+    this.emit("sweep:end", event);
+  }
+
+  private emitSweepError(startedAt: number, error: unknown) {
+    const event: ExpireSweepErrorEvent = {
+      startedAt,
+      durationMs: Date.now() - startedAt,
+      error,
+    };
+    this.emit("sweep:error", event);
+  }
+
+  private async runExpireSweep(): Promise<ExpireSweepStats> {
+    const startedAt = Date.now();
+    this.emitSweepStart(startedAt);
+
+    try {
+      if (this.opts.useIndexFile) {
+        await this.ensureIndexDatabase();
+        const db = this.requireIndexDb();
+        const now = Date.now();
+        const pattern = this.namespaceIdentityPattern();
+        const totalFiles = (
+          db.prepare(`SELECT COUNT(*) as count FROM entries`).get() as {
+            count: number;
+          }
+        ).count;
+        const namespaceFiles = (
+          db
+            .prepare(
+              `SELECT COUNT(*) as count FROM entries WHERE identity LIKE ?`,
+            )
+            .get(pattern) as { count: number }
+        ).count;
+        let deleted = 0;
+
+        const expiredRows = db
+          .prepare(
+            `
+          SELECT identity, file_name as fileName, expires_at as expiresAt
           FROM entries
           WHERE identity LIKE ? AND expires_at IS NOT NULL AND expires_at <= ?
         `,
-        )
-        .all(pattern, now) as Array<{ identity: string; fileName: string }>;
+          )
+          .all(pattern, now) as Array<{
+          identity: string;
+          fileName: string;
+          expiresAt: number;
+        }>;
 
-      for (const row of expiredRows) {
-        try {
-          await fsp.unlink(path.join(this.directory, row.fileName));
-          deleted += 1;
-        } catch (error) {
-          if (isNodeErrno(error) && error.code === "ENOENT") {
-            continue;
+        for (const row of expiredRows) {
+          try {
+            await fsp.unlink(path.join(this.directory, row.fileName));
+            deleted += 1;
+            this.emitSweepFileDeleted({
+              identity: row.identity,
+              key: this.decodeIdentityToKey(row.identity),
+              fileName: row.fileName,
+              expiresAt: row.expiresAt,
+              reason: "expired",
+            });
+          } catch (error) {
+            if (isNodeErrno(error) && error.code === "ENOENT") {
+              continue;
+            }
+
+            throw error;
           }
-
-          throw error;
         }
-      }
 
-      db.prepare(
-        `
+        db.prepare(
+          `
           DELETE FROM entries
           WHERE identity LIKE ? AND expires_at IS NOT NULL AND expires_at <= ?
         `,
-      ).run(pattern, now);
+        ).run(pattern, now);
 
-      return {
+        const stats: ExpireSweepStats = {
+          totalFiles,
+          namespaceFiles,
+          deletedFiles: deleted,
+          durationMs: Date.now() - startedAt,
+        };
+        this.emitSweepEnd(startedAt, stats);
+        return stats;
+      }
+
+      await this.ensureDirectory();
+      await this.ensureEntryIndex();
+      const now = Date.now();
+      let totalFiles = 0;
+      let namespaceFiles = 0;
+      let deleted = 0;
+
+      for await (const dirent of await fsp.opendir(this.directory)) {
+        if (!dirent.isFile()) {
+          continue;
+        }
+
+        totalFiles += 1;
+
+        const parsed = this.parseEntryFileName(dirent.name);
+        if (!parsed) {
+          continue;
+        }
+
+        namespaceFiles += 1;
+
+        if (parsed.expiresAt === undefined || parsed.expiresAt > now) {
+          continue;
+        }
+
+        try {
+          await fsp.unlink(path.join(this.directory, dirent.name));
+          this.entryIndex.delete(parsed.identity);
+          deleted += 1;
+          this.emitSweepFileDeleted({
+            identity: parsed.identity,
+            key: parsed.key,
+            fileName: dirent.name,
+            expiresAt: parsed.expiresAt,
+            reason: "expired",
+          });
+        } catch (error) {
+          if (!isNodeErrno(error) || error.code !== "ENOENT") {
+            throw error;
+          }
+        }
+      }
+
+      const stats: ExpireSweepStats = {
         totalFiles,
         namespaceFiles,
         deletedFiles: deleted,
         durationMs: Date.now() - startedAt,
       };
+      this.emitSweepEnd(startedAt, stats);
+      return stats;
+    } catch (error) {
+      this.emitSweepError(startedAt, error);
+      throw error;
     }
-
-    await this.ensureDirectory();
-    await this.ensureEntryIndex();
-    const startedAt = Date.now();
-    const now = Date.now();
-    let totalFiles = 0;
-    let namespaceFiles = 0;
-    let deleted = 0;
-
-    for await (const dirent of await fsp.opendir(this.directory)) {
-      if (!dirent.isFile()) {
-        continue;
-      }
-
-      totalFiles += 1;
-
-      const parsed = this.parseEntryFileName(dirent.name);
-      if (!parsed) {
-        continue;
-      }
-
-      namespaceFiles += 1;
-
-      if (parsed.expiresAt === undefined || parsed.expiresAt > now) {
-        continue;
-      }
-
-      try {
-        await fsp.unlink(path.join(this.directory, dirent.name));
-        this.entryIndex.delete(parsed.identity);
-        deleted += 1;
-      } catch (error) {
-        if (!isNodeErrno(error) || error.code !== "ENOENT") {
-          throw error;
-        }
-      }
-    }
-
-    return {
-      totalFiles,
-      namespaceFiles,
-      deletedFiles: deleted,
-      durationMs: Date.now() - startedAt,
-    };
   }
 
   public async disconnect(): Promise<void> {

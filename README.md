@@ -38,6 +38,28 @@ await keyv.set("image", fileBuffer);
 const value = await keyv.get("image");
 ```
 
+### Using Readable Values Through Keyv
+
+If you want to store Node `Readable` or Web `ReadableStream` values through `Keyv`, disable Keyv-level serialization so the adapter receives the original stream payload.
+
+```js
+import Keyv from "keyv";
+import { createReadStream } from "fs";
+import { KeyvFilesystem } from "keyv-filesystem";
+
+const keyv = new Keyv({
+  store: new KeyvFilesystem({
+    path: "./node_modules/.cache/keyv-filesystem",
+  }),
+  serialize: undefined,
+  deserialize: undefined,
+});
+
+await keyv.set("video", createReadStream("./assets/video.bin"));
+```
+
+Why: Keyv's default serializer converts values to JSON-compatible data. For stream objects, this stores stream metadata instead of streamed bytes. With `serialize`/`deserialize` set to `undefined`, `keyv-filesystem` writes the actual stream content.
+
 ### Default Serializer Input Types
 
 The default serializer accepts exactly these input types:
@@ -164,6 +186,50 @@ type ExpiredCheckDelayResolver = (
 The default callback uses these metrics to adapt the next interval and includes a built-in minimum of 1 minute.
 No global minimum is enforced for user-supplied numbers or user-supplied callbacks.
 Scheduling is always end-to-start: the next timeout begins after the current sweep completes.
+
+### Sweep Lifecycle Events
+
+`KeyvFilesystem` extends `EventEmitter` and emits additional sweep lifecycle events:
+
+- `sweep:start`
+  - Payload: `{ startedAt, useIndexFile, namespace }`
+  - Emitted when an expiry sweep begins.
+- `sweep:fileDeleted`
+  - Payload: `{ identity, key, fileName, expiresAt, reason }`
+  - Emitted for each expired file successfully removed during a sweep.
+  - `reason` is currently always `"expired"`.
+- `sweep:end`
+  - Payload: `{ totalFiles, namespaceFiles, deletedFiles, durationMs, startedAt, endedAt }`
+  - Emitted after a sweep completes successfully.
+- `sweep:error`
+  - Payload: `{ startedAt, durationMs, error }`
+  - Emitted when a sweep fails with an error.
+
+Example:
+
+```ts
+import { KeyvFilesystem } from "keyv-filesystem";
+
+const store = new KeyvFilesystem({
+  path: "./node_modules/.cache/keyv-filesystem",
+});
+
+store.on("sweep:start", (event) => {
+  console.log("sweep started", event);
+});
+
+store.on("sweep:fileDeleted", (event) => {
+  console.log("expired file removed", event.fileName, event.key);
+});
+
+store.on("sweep:end", (event) => {
+  console.log("sweep finished", event.deletedFiles, event.durationMs);
+});
+
+store.on("sweep:error", (event) => {
+  console.error("sweep failed", event.error);
+});
+```
 
 Example custom strategy:
 
