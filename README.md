@@ -2,7 +2,7 @@
 
 Filesystem storage adapter for Keyv, optimized for binary files on disk with one file per entry.
 
-[![publish](https://github.com/erkstruwe/keyv-filesystem/actions/workflows/publish.yml/badge.svg)](https://github.com/erkstruwe/keyv-filesystem/actions/workflows/publish.yml)
+[![CI](https://github.com/erkstruwe/keyv-filesystem/actions/workflows/ci.yml/badge.svg)](https://github.com/erkstruwe/keyv-filesystem/actions/workflows/ci.yml)
 
 ## Install
 
