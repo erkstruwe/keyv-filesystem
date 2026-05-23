@@ -1,300 +1,501 @@
-'use strict'
+import { randomUUID } from "crypto";
+import fs from "fs";
+import { promises as fsp } from "fs";
+import EventEmitter from "events";
+import path from "path";
+import { Readable } from "stream";
+import { pipeline } from "stream/promises";
+import { ReadableStream as WebReadableStream } from "stream/web";
+import type { KeyvStoreAdapter } from "keyv";
 
-import * as os from 'os'
-import * as fs from 'fs'
-import * as fsp from 'fs/promises'
-import EventEmitter from 'events'
-import type { KeyvStoreAdapter } from 'keyv'
-import { defaultDeserialize, defaultSerialize } from '@keyv/serialize'
-import path from 'path'
-import { handleIOError, SeparatedFileHelper } from './separated-file-store'
-export * from './make-field'
+export type DefaultSetValue = Buffer | Readable | WebReadableStream;
 
-export interface Options {
-  deserialize: (val: string | Buffer) => any
-  dialect: string
-  /** milliseconds */
-  expiredCheckDelay: number
-  filename: string
-  serialize: (val: any) => string | Buffer
-  /** milliseconds */
-  writeDelay: number
-  /** create lock file and check if exists */
-  checkFileLock: boolean
+type Serializer<SetValue> = (value: SetValue) => Readable | Promise<Readable>;
 
+type Deserializer<GetValue> =
+  (value: Readable) => GetValue | Promise<GetValue>;
+
+export interface Options<SetValue = DefaultSetValue, GetValue = Buffer> {
+  /** Keyv adapter dialect hint used by Keyv internals. */
+  dialect: string;
+  /** Directory used for one-file-per-entry storage. */
+  path: string;
+  /** Scan interval for expiring files in milliseconds. */
+  expiredCheckDelay: number;
+  /** Far-future timestamp used for "never expires" entries. */
+  sentinelExpire: number;
+  /** File extension used for entry files. */
+  extension: string;
+  /** Optional serializer used when writing values. */
+  serialize: Serializer<SetValue>;
+  /** Optional deserializer used when reading bytes from disk. */
+  deserialize: Deserializer<GetValue>;
   /**
-   * default: false
-   * if true, will store key values in seperated file as `opts.filename+key`
+   * Durability mode.
+   * - standard: atomic temp+rename
+   * - strict: atomic temp+rename with fsync best-effort
    */
-  separatedFile: boolean
+  durability: "standard" | "strict";
 }
 
-export const defaultOpts: Options = {
-  deserialize: (val: string | Buffer) => defaultDeserialize(val.toString()),
-  dialect: 'redis',
-  expiredCheckDelay: 24 * 3600 * 1000, // ms
-  filename: `${os.tmpdir()}/keyv-file/default.json`,
-  serialize: defaultSerialize,
-  writeDelay: 100, // ms
-  checkFileLock: false,
-  separatedFile: false,
+export type KeyvFilesystemOptions<
+  SetValue = DefaultSetValue,
+  GetValue = Buffer,
+> = {
+  path: string;
+} & Partial<Omit<Options<SetValue, GetValue>, "path">>;
+
+function isNodeReadable(value: unknown): value is Readable {
+  return value instanceof Readable;
 }
 
-function isNumber(val: any): val is number {
-  return typeof val === 'number'
-}
-export interface WrappedValue<T = any> {
-  value: T
-  expire?: number
+function isWebReadableStream(value: unknown): value is WebReadableStream {
+  return value instanceof WebReadableStream;
 }
 
-export class KeyvFile extends EventEmitter implements KeyvStoreAdapter {
-  public ttlSupport = true
-  public namespace?: string
-  public opts: Options
-  private _data: Map<string, WrappedValue> = new Map()
-  private _lastExpire = 0
-
-  private _separated: SeparatedFileHelper
-  constructor(options?: Partial<Options>) {
-    super()
-    this.opts = Object.assign({}, defaultOpts, options)
-    this._separated = new SeparatedFileHelper(this.opts)
-    if (this.opts.checkFileLock) {
-      this.acquireFileLock()
-    }
-    if (this.opts.separatedFile) {
-      fs.mkdirSync(this.opts.filename, { recursive: true })
-      this._lastExpire = this._separated.getLastExpire()
-    } else {
-      this._loadDataSync()
-    }
+function defaultReadableSerializer(value: DefaultSetValue): Readable {
+  if (Buffer.isBuffer(value)) {
+    return Readable.from([value]);
   }
 
+  if (isNodeReadable(value)) {
+    return value;
+  }
 
-  private _loadDataSync() {
+  if (isWebReadableStream(value)) {
+    return Readable.fromWeb(value);
+  }
+
+  throw new TypeError(
+    "Default serializer only accepts Buffer, Readable, or ReadableStream",
+  );
+}
+
+async function defaultReadableDeserializer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(toBufferChunk(chunk));
+  }
+
+  return Buffer.concat(chunks);
+}
+
+export const defaultOpts: Omit<Options<DefaultSetValue, Buffer>, "path"> = {
+  dialect: "redis",
+  expiredCheckDelay: 24 * 3600 * 1000,
+  sentinelExpire: Date.parse("2100-01-01T00:00:00.000Z"),
+  extension: ".bin",
+  serialize: defaultReadableSerializer,
+  deserialize: defaultReadableDeserializer,
+  durability: "standard",
+};
+
+function isNodeErrno(error: unknown): error is NodeJS.ErrnoException {
+  return !!error && typeof error === "object" && "code" in error;
+}
+
+function toBufferChunk(chunk: unknown): Buffer {
+  if (Buffer.isBuffer(chunk)) {
+    return chunk;
+  }
+
+  if (typeof chunk === "string") {
+    return Buffer.from(chunk);
+  }
+
+  if (chunk instanceof Uint8Array) {
+    return Buffer.from(chunk);
+  }
+
+  if (chunk instanceof ArrayBuffer) {
+    return Buffer.from(new Uint8Array(chunk));
+  }
+
+  if (ArrayBuffer.isView(chunk)) {
+    return Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  }
+
+  throw new TypeError(
+    "Stream chunks must be Buffer, Uint8Array, ArrayBuffer, DataView, or string",
+  );
+}
+
+function keyToBaseName(key: string): string {
+  return `k_${Buffer.from(key).toString("base64url")}`;
+}
+
+function namespaceToBaseName(namespace: string): string {
+  return `n_${Buffer.from(namespace).toString("base64url")}`;
+}
+
+function baseNameToKey(baseName: string): string | undefined {
+  if (!baseName.startsWith("k_")) {
+    return;
+  }
+
+  try {
+    return Buffer.from(baseName.slice(2), "base64url").toString("utf8");
+  } catch {
+    return;
+  }
+}
+
+async function fsyncFile(filePath: string) {
+  const handle = await fsp.open(filePath, "r");
+  try {
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function fsyncDirectory(dirPath: string) {
+  try {
+    const handle = await fsp.open(dirPath, "r");
     try {
-      const data = this.opts.deserialize(fs.readFileSync(this.opts.filename))
-      if (!Array.isArray(data.cache)) {
-        const _cache = data.cache
-        data.cache = []
-        for (const key in _cache) {
-          if (_cache.hasOwnProperty(key)) {
-            data.cache.push([key, _cache[key]])
-          }
-        }
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    // Directory fsync is not supported on some platforms/filesystems.
+    if (
+      !isNodeErrno(error) ||
+      (error.code !== "EINVAL" &&
+        error.code !== "ENOTSUP" &&
+        error.code !== "EPERM")
+    ) {
+      throw error;
+    }
+  }
+}
+
+export class KeyvFilesystem<
+  SetValue = DefaultSetValue,
+  GetValue = Buffer,
+> extends EventEmitter implements KeyvStoreAdapter {
+  public ttlSupport = true;
+
+  public namespace?: string;
+
+  public readonly opts: Options<SetValue, GetValue>;
+
+  private readonly directory: string;
+
+  private gcInterval?: NodeJS.Timeout;
+
+  private gcInFlight?: Promise<number>;
+
+  constructor(options: KeyvFilesystemOptions<SetValue, GetValue>) {
+    super();
+    if (!options?.path || options.path.trim().length === 0) {
+      throw new Error("KeyvFilesystem requires a non-empty options.path");
+    }
+
+    this.directory = path.resolve(options.path);
+    this.opts = {
+      ...(defaultOpts as unknown as Omit<Options<SetValue, GetValue>, "path">),
+      ...options,
+      serialize:
+        options.serialize ??
+        (defaultReadableSerializer as Serializer<SetValue>),
+      deserialize:
+        options.deserialize ??
+        (defaultReadableDeserializer as Deserializer<GetValue>),
+      path: this.directory,
+    };
+
+    this.ensureDirectory().catch((error) => this.emit("error", error));
+    this.gcInterval = setInterval(() => {
+      void this.clearExpire().catch((error) => this.emit("error", error));
+    }, this.opts.expiredCheckDelay);
+    this.gcInterval.unref?.();
+  }
+
+  private async ensureDirectory() {
+    await fsp.mkdir(this.directory, { recursive: true });
+  }
+
+  private entryPath(key: string): string {
+    const namespaceBaseName =
+      this.namespace === undefined
+        ? undefined
+        : namespaceToBaseName(this.namespace);
+    const keyBaseName = keyToBaseName(key);
+    const fileBaseName = namespaceBaseName
+      ? `${namespaceBaseName}__${keyBaseName}`
+      : keyBaseName;
+
+    return path.join(
+      this.directory,
+      `${fileBaseName}${this.opts.extension}`,
+    );
+  }
+
+  private decodeFileName(fileName: string): string | undefined {
+    if (!fileName.endsWith(this.opts.extension)) {
+      return;
+    }
+
+    const baseName = fileName.slice(0, -this.opts.extension.length);
+
+    if (this.namespace === undefined) {
+      if (baseName.startsWith("n_")) {
+        return;
       }
-      this._data = new Map(data.cache)
-      this._lastExpire = data.lastExpire
-    } catch (e) {
-      handleIOError(e, '_loadDataSync')
-      this._data = new Map()
-      this._lastExpire = Date.now()
+
+      return baseNameToKey(baseName);
     }
+
+    const namespaceBaseName = namespaceToBaseName(this.namespace);
+    const namespacedPrefix = `${namespaceBaseName}__`;
+    if (!baseName.startsWith(namespacedPrefix)) {
+      return;
+    }
+
+    const keyBaseName = baseName.slice(namespacedPrefix.length);
+    return baseNameToKey(keyBaseName);
   }
 
-  private get _lockFile() {
-    if (this.opts.separatedFile) {
-      return this._separated.lockFile
+  private ttlToExpires(ttl?: number): number {
+    if (typeof ttl !== "number" || ttl <= 0) {
+      return this.opts.sentinelExpire;
     }
-    return this.opts.filename + '.lock'
+
+    return Date.now() + ttl;
   }
 
-  acquireFileLock() {
+  private isExpired(expiresAt: number): boolean {
+    return expiresAt < this.opts.sentinelExpire && expiresAt <= Date.now();
+  }
+
+  private async writeAtomicFromReadable(
+    targetPath: string,
+    payload: Readable,
+    expiresAt: number,
+  ): Promise<void> {
+    await this.ensureDirectory();
+    const tempPath = `${targetPath}.tmp-${process.pid}-${randomUUID()}`;
+
     try {
-      let fd = fs.openSync(this._lockFile, 'wx')
-      fs.closeSync(fd)
+      await pipeline(payload, fs.createWriteStream(tempPath));
+      const nowSec = Date.now() / 1000;
+      await fsp.utimes(tempPath, nowSec, expiresAt / 1000);
+      if (this.opts.durability === "strict") {
+        await fsyncFile(tempPath);
+      }
 
-      process.on('SIGINT', () => {
-        this.releaseFileLock()
-        process.exit(0)
-      })
-      process.on('exit', () => {
-        this.releaseFileLock()
-      })
+      await fsp.rename(tempPath, targetPath);
+      if (this.opts.durability === "strict") {
+        await fsyncDirectory(this.directory);
+      }
     } catch (error) {
-      console.error(`[keyv-file] There is another process using this file`)
-      throw error
+      await fsp.rm(tempPath, { force: true }).catch(() => undefined);
+      throw error;
     }
   }
 
-  releaseFileLock() {
+  private async statWithMiss(pathToStat: string) {
     try {
-      fs.unlinkSync(this._lockFile)
-    } catch (e) {
-      //pass
-      handleIOError(e, "releaseFileLock")
-    }
-  }
-  public async get<Value>(key: string): Promise<Value | undefined> {
-    if (this.opts.separatedFile) {
-      let data = await this._separated.get(key)
-      return this._getWithExpire(key, data)
-    }
-    return this.getSync(key)
-  }
-
-  public getSync<Value>(key: string): Value | undefined {
-    if (this.opts.separatedFile) {
-      let data = this._separated.getSync(key)
-      return this._getWithExpire(key, data)
-    }
-    let ret: Value | undefined = void 0
-    try {
-      const data = this._data.get(key)
-      return this._getWithExpire(key, data)
+      return await fsp.stat(pathToStat);
     } catch (error) {
-      handleIOError(error, key)
+      if (isNodeErrno(error) && error.code === "ENOENT") {
+        return;
+      }
+
+      throw error;
     }
-    return ret
   }
 
-  public async getMany<Value>(keys: string[]): Promise<Array<Value | undefined>> {
-    if (this.opts.separatedFile) {
-      return Promise.all(keys.map((key) => this.get<Value>(key)))
+  public async get<Value = GetValue>(
+    key: string,
+  ): Promise<Value | undefined> {
+    const entry = this.entryPath(key);
+    const stat = await this.statWithMiss(entry);
+    if (!stat) {
+      return;
     }
-    return keys.map((key) => this.getSync(key))
-  }
-  /**
-   * Note: `await kv.set()` will wait <options.writeDelay> millseconds to save to disk, it would be slow. Please remove `await` if you find performance issues.
-   * @param key
-   * @param value
-   * @param ttl
-   * @returns
-   */
-  public async set(key: string, value: any, ttl?: number) {
-    if (ttl === 0) {
-      ttl = undefined
-    }
-    value = {
-      expire: isNumber(ttl) ? Date.now() + ttl : undefined,
-      value: value as any,
-    }
-    this.clearExpire()
 
-    if (this.opts.separatedFile) {
-      return this._separated.set(key, value)
+    const expiresAt = stat.mtimeMs;
+    if (this.isExpired(expiresAt)) {
+      await this.delete(key);
+      return;
     }
-    this._data.set(key, value)
-    return this.save()
+
+    const readable = fs.createReadStream(entry);
+    try {
+      return (await this.opts.deserialize(readable)) as Value;
+    } catch (error) {
+      readable.destroy();
+      if (isNodeErrno(error) && error.code === "ENOENT") {
+        return;
+      }
+
+      throw error;
+    }
   }
 
-  public async delete(key: string) {
-    if (this.opts.separatedFile) {
-      return this._separated.delete(key)
+  public async getMany<Value>(
+    keys: string[],
+  ): Promise<Array<Value | undefined>> {
+    return Promise.all(keys.map((key) => this.get<Value>(key)));
+  }
+
+  public async set(key: string, value: SetValue, ttl?: number): Promise<void> {
+    const entry = this.entryPath(key);
+    const expiresAt = this.ttlToExpires(ttl);
+
+    const payload = await this.opts.serialize(value);
+    await this.writeAtomicFromReadable(entry, payload, expiresAt);
+  }
+
+  public async setMany(
+    values: Array<{ key: string; value: SetValue; ttl?: number }>,
+  ): Promise<void> {
+    await Promise.all(
+      values.map((entry) => this.set(entry.key, entry.value, entry.ttl)),
+    );
+  }
+
+  public async delete(key: string): Promise<boolean> {
+    try {
+      await fsp.unlink(this.entryPath(key));
+      return true;
+    } catch (error) {
+      if (isNodeErrno(error) && error.code === "ENOENT") {
+        return false;
+      }
+
+      throw error;
     }
-    const ret = this._data.delete(key)
-    await this.save()
-    return ret
   }
 
   public async deleteMany(keys: string[]): Promise<boolean> {
-    if (this.opts.separatedFile) {
-      let ret = await Promise.all(keys.map((key) => this.delete(key)))
-      return ret.every((r) => r)
-    }
-    let res = keys.every((key) => this._data.delete(key))
-    await this.save()
-    return res
+    const result = await Promise.all(keys.map((key) => this.delete(key)));
+    return result.every(Boolean);
   }
 
-  public async clear() {
-    if (this.opts.separatedFile) {
-      await this._separated.clear()
-      this._lastExpire = 0
-      return true
+  public async clear(): Promise<void> {
+    await this.ensureDirectory();
+    const pending: Promise<void>[] = [];
+    for await (const dirent of await fsp.opendir(this.directory)) {
+      if (!dirent.isFile()) {
+        continue;
+      }
+
+      const key = this.decodeFileName(dirent.name);
+      if (key === undefined) {
+        continue;
+      }
+
+      pending.push(fsp.unlink(path.join(this.directory, dirent.name)));
+      if (pending.length >= 64) {
+        await Promise.all(pending);
+        pending.length = 0;
+      }
     }
-    this._data = new Map()
-    this._lastExpire = Date.now()
-    return this.save()
+
+    if (pending.length > 0) {
+      await Promise.all(pending);
+    }
+
+    return;
   }
 
   public async has(key: string): Promise<boolean> {
-    const value = await this.get(key)
-    return value !== undefined
+    return (await this.get(key)) !== undefined;
   }
 
-  private isExpired(data: WrappedValue) {
-    return isNumber(data.expire) && data.expire <= Date.now()
+  public async hasMany(keys: string[]): Promise<boolean[]> {
+    return Promise.all(keys.map((key) => this.has(key)));
   }
 
-  private _getWithExpire(key: string, data?: WrappedValue) {
-    if (!data) {
-      return
+  public async clearExpire(): Promise<number> {
+    if (this.gcInFlight) {
+      return this.gcInFlight;
     }
-    if (this.isExpired(data)) {
-      this.delete(key)
-      return
-    }
-    return data.value
-  }
 
-  private clearExpire() {
-    const now = Date.now()
-    if (now - this._lastExpire <= this.opts.expiredCheckDelay) {
-      return
-    }
-    this._lastExpire = now
-    if (this.opts.separatedFile) {
-      this._separated.clearExpire((key) => this.get(key))
-      return
-    }
-    for (const key of this._data.keys()) {
-      const data = this._data.get(key)
-      this._getWithExpire(key, data)
+    this.gcInFlight = this.runExpireSweep();
+    try {
+      return await this.gcInFlight;
+    } finally {
+      this.gcInFlight = undefined;
     }
   }
 
-  private async saveToDisk() {
-    const cache = [] as [string, any][]
-    for (const [key, val] of this._data) {
-      cache.push([key, val])
-    }
-    const data = this.opts.serialize({
-      cache,
-      lastExpire: this._lastExpire,
-    })
-    await fsp.mkdir(path.dirname(this.opts.filename), {
-      recursive: true,
-    })
-    return fsp.writeFile(this.opts.filename, data)
-  }
+  private async runExpireSweep(): Promise<number> {
+    await this.ensureDirectory();
+    let deleted = 0;
 
-  private _savePromise?: Promise<any>
-
-  private save() {
-    this.clearExpire()
-    if (this._savePromise) {
-      return this._savePromise
-    }
-    this._savePromise = new Promise<void>((resolve, reject) => {
-      setTimeout(() => {
-        this.saveToDisk()
-          .then(resolve, reject)
-          .finally(() => {
-            this._savePromise = void 0
-          })
-      }, this.opts.writeDelay)
-    })
-    return this._savePromise
-  }
-
-  public disconnect(): Promise<void> {
-    return Promise.resolve()
-  }
-
-  public async *iterator(namespace?: string) {
-    let entries = this.opts.separatedFile ? await this._separated.entries() : this._data.entries()
-    for (const [key, data] of entries) {
-      if (key === undefined || data === undefined) {
-        continue
+    for await (const dirent of await fsp.opendir(this.directory)) {
+      if (!dirent.isFile()) {
+        continue;
       }
-      // Filter by namespace if provided
-      if (!namespace || key.includes(namespace)) {
-        yield [key, data.value]
+
+      const fileName = dirent.name;
+      const key = this.decodeFileName(fileName);
+      if (key === undefined) {
+        continue;
+      }
+
+      const entry = path.join(this.directory, fileName);
+      const stat = await this.statWithMiss(entry);
+      if (!stat) {
+        continue;
+      }
+
+      if (!this.isExpired(stat.mtimeMs)) {
+        continue;
+      }
+
+      try {
+        await fsp.unlink(entry);
+        deleted += 1;
+      } catch (error) {
+        if (!isNodeErrno(error) || error.code !== "ENOENT") {
+          throw error;
+        }
+      }
+    }
+
+    return deleted;
+  }
+
+  public async disconnect(): Promise<void> {
+    if (this.gcInterval) {
+      clearInterval(this.gcInterval);
+      this.gcInterval = undefined;
+    }
+  }
+
+  public async *iterator<Value>(
+    namespace?: string,
+  ): AsyncGenerator<[string, Value], void> {
+    await this.ensureDirectory();
+
+    for await (const dirent of await fsp.opendir(this.directory)) {
+      if (!dirent.isFile()) {
+        continue;
+      }
+
+      const key = this.decodeFileName(dirent.name);
+      if (key === undefined) {
+        continue;
+      }
+
+      if (
+        namespace &&
+        !(key === namespace || key.startsWith(`${namespace}:`))
+      ) {
+        continue;
+      }
+
+      const value = await this.get<Value>(key);
+      if (value !== undefined) {
+        yield [key, value];
       }
     }
   }
 }
 
-export default KeyvFile
+export default KeyvFilesystem;

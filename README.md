@@ -1,70 +1,155 @@
-# keyv-file [<img width="100" align="right" src="https://rawgit.com/lukechilds/keyv/master/media/logo.svg" alt="keyv">](https://github.com/lukechilds/keyv)
+# keyv-filesystem
 
-> File storage adapter for Keyv, using json to serialize data fast and small.
+Filesystem storage adapter for Keyv, optimized for binary files on disk with one file per entry.
 
-[![publish](https://github.com/zaaack/keyv-file/actions/workflows/publish.yml/badge.svg)](https://github.com/zaaack/keyv-file/actions/workflows/publish.yml)
-[![npm](https://img.shields.io/npm/v/keyv-file.svg)](https://www.npmjs.com/package/keyv-file)
-
-File storage adapter for [Keyv](https://github.com/lukechilds/keyv).
-
-TTL functionality is handled internally by interval scan, don't need to panic about expired data take too much space.
+[![publish](https://github.com/erkstruwe/keyv-filesystem/actions/workflows/publish.yml/badge.svg)](https://github.com/erkstruwe/keyv-filesystem/actions/workflows/publish.yml)
 
 ## Install
 
 ```shell
-npm install --save keyv keyv-file
+npm install --save keyv keyv-filesystem
 ```
 
 ## Usage
 
-### Using with AI agent
+`path` is required when creating `KeyvFilesystem`.
 
-```sh
-npx skills add https://github.com/zaaack/prompts --skill keyv-file
-
-```
-
-### Using with keyv
 ```js
-const Keyv = require('keyv')
-const { KeyvFile } = require('keyv-file')
+import Keyv from "keyv";
+import { readFile } from "fs/promises";
+import { KeyvFilesystem } from "keyv-filesystem";
 
 const keyv = new Keyv({
-  store: new KeyvFile()
+  store: new KeyvFilesystem({
+    path: "./node_modules/.cache/keyv-filesystem",
+  }),
 });
-// More options with default value:
-const customKeyv = new Keyv({
-  store: new KeyvFile({
-    filename: `${os.tmpdir()}/keyv-file/default.json`, // the file path to store the data
-    expiredCheckDelay: 24 * 3600 * 1000, // ms, check and remove expired data in each ms
-    writeDelay: 100, // ms, batch write to disk in a specific duration, enhance write performance.
-    encode: JSON.stringify, // serialize function
-    decode: JSON.parse // deserialize function
-  })
-})
+
+const fileBuffer = await readFile("./assets/image.bin");
+await keyv.set("image", fileBuffer);
+const value = await keyv.get("image");
 ```
 
-### Using directly
+### Default Serializer Input Types
+
+The default serializer accepts exactly these input types:
+
+```js
+import { open, readFile } from "fs/promises";
+import { createReadStream } from "fs";
+import { Readable } from "stream";
+
+// 1) Buffer
+const fileBuffer = await readFile("./assets/image.bin");
+await keyv.set("as-buffer", fileBuffer);
+
+// 2) Node Readable
+const readableFromFile = createReadStream("./assets/video.bin");
+await keyv.set("as-node-readable", readableFromFile);
+
+// 3) Web ReadableStream
+const fileHandle = await open("./assets/archive.bin", "r");
+await keyv.set(
+  "as-web-readable-stream",
+  fileHandle.readableWebStream(),
+);
+await fileHandle.close();
+```
+
+### JSON Object Example (Readable <-> Object)
 
 ```ts
-import KeyvFile, { makeField } from 'keyv-file'
+import { Readable } from "stream";
+import { KeyvFilesystem } from "keyv-filesystem";
 
-class Kv extends KeyvFile {
-  constructor() {
-    super({
-      filename: './db.json'
-    })
-  }
-  someField = makeField(this, 'field_key')
-}
+type UserProfile = {
+  id: string;
+  name: string;
+};
 
-export const kv = new Kv
+const store = new KeyvFilesystem<UserProfile, UserProfile>({
+  path: "./node_modules/.cache/keyv-json-store",
 
-kv.someField.get(1) // empty return default value 1
-kv.someField.set(2) // set value 2
-kv.someField.get() // return saved value 2
-kv.someField.delete() // delete field
+  // Object -> JSON bytes -> Readable
+  serialize: (value) => Readable.from([Buffer.from(JSON.stringify(value))]),
+
+  // Readable -> bytes -> JSON -> Object
+  deserialize: async (stream) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+
+    return JSON.parse(Buffer.concat(chunks).toString("utf8")) as UserProfile;
+  },
+});
+
+await store.set("user:1", { id: "1", name: "Ada" });
+const user = await store.get("user:1"); // typed as UserProfile | undefined
 ```
+
+## How It Works
+
+- One file per key under `path`.
+- File mtime stores expiration time.
+- Non-expiring values use a configurable far-future sentinel timestamp.
+- Expired values are deleted on read and by periodic sweep (`expiredCheckDelay`).
+
+## Options
+
+- `path` (required): storage directory. There is no default.
+- `expiredCheckDelay` (default `86400000`): sweep interval in milliseconds.
+- `sentinelExpire` (default `Date.parse('2100-01-01T00:00:00.000Z')`): far-future timestamp used to represent non-expiring entries.
+- `extension` (default `.bin`): file extension for entry files.
+- `serialize` (default serializer): `(Buffer | Readable | ReadableStream) -> Readable`.
+- `deserialize` (default deserializer): `Readable -> Buffer`.
+- `durability` (default `standard`): write durability strategy.
+- `dialect` (default `redis`): Keyv compatibility hint for iterable adapter detection.
+
+### Durability Modes
+
+- `standard`:
+  - Write entry payload to a temp file in the same directory.
+  - Atomically rename temp file to the final key path.
+  - This is fast and protects against most partial-write corruption scenarios.
+- `strict`:
+  - Same temp-file + rename flow as `standard`.
+  - Also performs best-effort `fsync` on the temp file before rename.
+  - Also performs best-effort directory `fsync` after rename.
+  - This reduces data-loss risk during sudden power loss/crash at the cost of extra IO latency.
+
+For most workloads, `standard` is enough. Use `strict` when durability is more important than write throughput.
+
+### Default Optional Values
+
+```js
+{
+  dialect: 'redis',
+  expiredCheckDelay: 24 * 3600 * 1000,
+  sentinelExpire: Date.parse('2100-01-01T00:00:00.000Z'),
+  extension: '.bin',
+  serialize: (value) => Readable,
+  deserialize: async (stream) => Buffer,
+  durability: 'standard',
+}
+```
+
+## Behavior Notes
+
+- Async file writes are always stream-based (`Readable` -> `Writable`).
+- Async file reads are always stream-based (`Readable` from disk).
+- `set` always routes values through `serialize` and expects a `Readable` result.
+- `get` always routes the file `Readable` through `deserialize`.
+- Default serializer accepts `Buffer`, Node `Readable`, and Web `ReadableStream` and converts to Node `Readable`.
+- Default deserializer consumes a Node `Readable` and returns a `Buffer`.
+- Custom serializers/deserializers must follow the same stream contracts at the boundaries.
+- The adapter exposes async operations only; synchronous cache APIs are intentionally not supported.
+- Writes set TTL metadata on the temp file and then atomically rename.
+- When `namespace` is set by Keyv, files are isolated by namespace within the same directory.
+- Only `ENOENT` is treated as cache miss; other IO errors are thrown.
+- Empty-string keys are supported consistently across `get`, `iterator`, `clear`, and expiry sweep.
+- Bulk methods `setMany` and `hasMany` are supported by the adapter.
+- Tests should use temporary subfolders under `node_modules/.cache/`.
 
 ## License
 

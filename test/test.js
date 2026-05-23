@@ -1,6 +1,4 @@
-const fs = require('fs')
-const {KeyvFile} = require('../lib/index.js');
-const { SafeFilenameEncoder } = require('../lib/safe-encoder.js');
+const { KeyvFilesystem } = require("../lib/index.js");
 
 // try {
 //   const lock = './test.lock'
@@ -23,16 +21,12 @@ const { SafeFilenameEncoder } = require('../lib/safe-encoder.js');
 //   throw error
 // }
 
-
-const store = new KeyvFile({
-  filename: `./node_modules/.cache/a-test`,
-  separatedFile: true
+const store = new KeyvFilesystem({
+  path: `./node_modules/.cache/a-test`,
 });
 async function main() {
-
-  // await store.set('foo', 'bar')
-  // console.log(await store.get('foo'))
-  console.log(SafeFilenameEncoder.encode("中文"))
+  await store.set("foo", Buffer.from("bar"));
+  console.log((await store.get("foo")).toString());
 }
 
-main().catch(console.error)
+main().catch(console.error);
