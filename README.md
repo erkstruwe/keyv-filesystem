@@ -10,6 +10,11 @@ Filesystem storage adapter for Keyv, optimized for binary files on disk with one
 npm install --save keyv keyv-filesystem
 ```
 
+## Runtime Dependencies
+
+This package currently has no runtime dependencies.
+Development dependencies are used only for building, testing, and formatting.
+
 ## Usage
 
 `path` is required when creating `KeyvFilesystem`.
