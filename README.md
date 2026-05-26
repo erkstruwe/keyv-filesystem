@@ -14,7 +14,7 @@ npm install --save keyv keyv-filesystem
 
 This package currently depends on:
 
-- `better-sqlite3` (used when `useIndexFile: true`)
+- `better-sqlite3`
 
 Development dependencies are used only for building, testing, and formatting.
 
@@ -137,11 +137,10 @@ const user = await store.get("user:1"); // typed as UserProfile | undefined
 ## How It Works
 
 - One file per key under `path`.
-- File names are encoded identities (namespace + key + expiry token), not raw key strings.
-- Expiration time is encoded in the entry filename as a suffix token.
-- Non-expiring values use the special filename token `never`.
+- File names are encoded identities (namespace + key), not raw key strings.
+- Expiration time is stored in the SQLite index (`expires_at`), not in file names.
 - Expired values are deleted on read and by periodic sweep (`expiredCheckDelay`).
-- Optional SQLite metadata index (`useIndexFile`) can be used for index-driven sweeps.
+- A SQLite metadata index is always used for lookups and sweeps.
 
 ## Options
 
@@ -152,7 +151,6 @@ const user = await store.get("user:1"); // typed as UserProfile | undefined
   - The delay always starts after a sweep has finished.
     This means the interval is measured from end of previous sweep to start of next sweep, for both `number` and `callback` modes.
 - `extension` (default `.bin`): file extension for entry files.
-- `useIndexFile` (default `false`): store metadata in `.keyv-filesystem-index.sqlite` and run normal sweeps against the index file instead of directory scans.
 - `serialize` (default serializer): `(Buffer | Readable | ReadableStream) -> Readable`.
 - `deserialize` (default deserializer): `Readable -> Buffer`.
 - `durability` (default `standard`): write durability strategy.
@@ -177,7 +175,6 @@ For most workloads, `standard` is enough. Use `strict` when durability is more i
 {
   expiredCheckDelay: (lastSweep) => number,
   extension: '.bin',
-  useIndexFile: false,
   serialize: (value) => Readable,
   deserialize: async (stream) => Buffer,
   durability: 'standard',
@@ -230,18 +227,18 @@ const store = new KeyvFilesystem({
 });
 ```
 
-### SQLite Index Mode
+### SQLite Index
 
-Set `useIndexFile: true` to enable a SQLite index file at:
+The adapter always uses a SQLite index file at:
 
 `<path>/.keyv-filesystem-index.sqlite`
 
-Behavior in this mode:
+Behavior:
 
-- If the index file does not exist yet, the adapter immediately starts a bootstrap sweep.
-- The bootstrap sweep scans existing entry files once, removes stale files, and populates the SQLite index.
+- If the index file does not exist yet, the adapter creates a new empty SQLite index.
+- Existing data files in the directory are left untouched and are not auto-imported into the index.
 - Regular sweeps (`clearExpire` and scheduled sweeps) then operate based on the SQLite index.
-- Expiration metadata still remains encoded in the entry filename suffix.
+- Lookups first resolve `(namespace, key)` in SQLite, then load or delete the data file depending on `expires_at`.
 - In `set`, the index row is written before the payload file is written.
   On crash, this can leave extra/stale index rows, which are reconciled later when file operations hit `ENOENT` and during sweeps.
 - During sweeps, SQLite cleanup is done by cutoff query (`DELETE ... WHERE expires_at <= cutoff`) for the active namespace scope.
@@ -253,26 +250,10 @@ Concurrency note for multiple instances sharing the same `path`:
 - In rare races, this can cause temporary drift (for example orphaned files or a recently written key being briefly missing from the index until a later operation/sweep reconciles state).
 - Recommended for strict correctness: one writer process per storage path.
 
-### When To Use `useIndexFile`
-
-Enable `useIndexFile: true` when:
-
-- Your store directory contains many files and directory-wide expiry sweeps become expensive.
-- You run frequent sweeps and want sweep cost to scale with expired index rows, not with full directory scans.
-- You want faster startup behavior after the first bootstrap pass for large stores.
-- You are okay with an additional runtime dependency (`better-sqlite3`) and a local SQLite file in the storage directory.
-
-Keep `useIndexFile: false` when:
-
-- Your store is small or moderate and directory scans are already cheap.
-- You prefer minimal operational complexity and no SQLite sidecar file.
-- You run in environments where native module handling for `better-sqlite3` is undesirable.
-
 Practical recommendation:
 
-- Default to `false` for small caches or simple deployments.
-- Switch to `true` for large, long-lived caches with high key churn and regular expiry cleanup.
-- For multi-process writes to the same path, use `true` only if temporary index/file drift is acceptable, or enforce a single writer process.
+- This adapter now assumes SQLite is available at runtime.
+- For multi-process writes to the same path, temporary index/file drift can still occur; for strict correctness, use a single writer process per storage path.
 
 ## Behavior Notes
 
@@ -284,7 +265,7 @@ Practical recommendation:
 - Default deserializer consumes a Node `Readable` and returns a `Buffer`.
 - Custom serializers/deserializers must follow the same stream contracts at the boundaries.
 - The adapter exposes async operations only; synchronous cache APIs are intentionally not supported.
-- Writes encode TTL in the final filename suffix token and then atomically rename.
+- Writes update TTL metadata in SQLite and atomically write the payload file.
 - When `namespace` is set by Keyv, files are isolated by namespace within the same directory.
 - Only `ENOENT` is treated as cache miss; other IO errors are thrown.
 - Empty-string keys are supported consistently across `get`, `iterator`, `clear`, and expiry sweep.

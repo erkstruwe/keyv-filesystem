@@ -109,8 +109,9 @@ describe("Serialization behavior", () => {
       expect((value as Buffer).toString("utf8")).toBe("hello keyv");
 
       const files = await fsp.readdir(dir);
-      expect(files.length).toBe(1);
-      const stored = await fsp.readFile(path.join(dir, files[0]!));
+      const entryFiles = files.filter((fileName) => fileName.endsWith(".bin"));
+      expect(entryFiles.length).toBe(1);
+      const stored = await fsp.readFile(path.join(dir, entryFiles[0]!));
       expect(stored.toString("utf8")).toBe("hello keyv");
     } finally {
       await keyv.disconnect();

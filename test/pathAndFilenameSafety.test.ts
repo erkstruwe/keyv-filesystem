@@ -42,7 +42,8 @@ describe("Path and filename safety", () => {
     expect(await store.get(key)).toBeUndefined();
 
     const files = await fsp.readdir(absDir);
-    expect(files.length).toBe(0);
+    const entryFiles = files.filter((fileName) => fileName.endsWith(".bin"));
+    expect(entryFiles.length).toBe(0);
 
     await store.disconnect();
   });
@@ -66,7 +67,8 @@ describe("Path and filename safety", () => {
     await store.clear();
 
     const files = await fsp.readdir(absDir);
-    expect(files.length).toBe(0);
+    const entryFiles = files.filter((fileName) => fileName.endsWith(".bin"));
+    expect(entryFiles.length).toBe(0);
 
     await store.disconnect();
   });

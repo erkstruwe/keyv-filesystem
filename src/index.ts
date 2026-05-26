@@ -36,8 +36,6 @@ export type ExpiredCheckDelayResolver = (
 ) => number | Promise<number>;
 
 const MIN_DEFAULT_EXPIRE_SWEEP_DELAY = 60_000;
-const EXPIRY_SUFFIX = "__exp_";
-const NO_TTL_EXPIRY_TOKEN = "never";
 const INDEX_FILE_NAME = ".keyv-filesystem-index.sqlite";
 const ADAPTER_DIALECT = "redis";
 
@@ -83,8 +81,6 @@ export interface Options<SetValue = DefaultSetValue, GetValue = Buffer> {
   expiredCheckDelay: number | ExpiredCheckDelayResolver;
   /** File extension used for entry files. */
   extension: string;
-  /** Use SQLite index file for metadata-driven operations and sweeps. */
-  useIndexFile: boolean;
   /** Optional serializer used when writing values. */
   serialize: Serializer<SetValue>;
   /** Optional deserializer used when reading bytes from disk. */
@@ -158,7 +154,6 @@ async function defaultReadableDeserializer(stream: Readable): Promise<Buffer> {
 export const defaultOpts: Omit<Options<DefaultSetValue, Buffer>, "path"> = {
   expiredCheckDelay: defaultExpiredCheckDelay,
   extension: ".bin",
-  useIndexFile: false,
   serialize: defaultReadableSerializer,
   deserialize: defaultReadableDeserializer,
   durability: "standard",
@@ -200,35 +195,6 @@ function keyToBaseName(key: string): string {
 
 function namespaceToBaseName(namespace: string): string {
   return `n_${Buffer.from(namespace).toString("base64url")}`;
-}
-
-function baseNameToKey(baseName: string): string | undefined {
-  if (!baseName.startsWith("k_")) {
-    return;
-  }
-
-  try {
-    return Buffer.from(baseName.slice(2), "base64url").toString("utf8");
-  } catch {
-    return;
-  }
-}
-
-function parseExpiryToken(token: string): number | undefined {
-  if (token === NO_TTL_EXPIRY_TOKEN) {
-    return;
-  }
-
-  if (!/^\d+$/.test(token)) {
-    return;
-  }
-
-  const expiresAt = Number(token);
-  if (!Number.isSafeInteger(expiresAt) || expiresAt <= 0) {
-    return;
-  }
-
-  return expiresAt;
 }
 
 async function fsyncFile(filePath: string) {
@@ -273,13 +239,6 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
 
   private readonly directory: string;
 
-  private readonly entryIndex = new Map<
-    string,
-    { fileName: string; expiresAt: number | undefined }
-  >();
-
-  private entryIndexReady?: Promise<void>;
-
   private indexDb?: Database.Database;
 
   private indexDbReady?: Promise<void>;
@@ -315,9 +274,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     };
 
     this.ensureDirectory().catch((error) => this.emit("error", error));
-    if (this.opts.useIndexFile) {
-      this.ensureIndexDatabase().catch((error) => this.emit("error", error));
-    }
+    this.ensureIndexDatabase().catch((error) => this.emit("error", error));
     void this.scheduleNextExpireSweep(undefined);
   }
 
@@ -325,12 +282,8 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     return path.join(this.directory, INDEX_FILE_NAME);
   }
 
-  private namespaceIdentityPattern(): string {
-    if (this.namespace === undefined) {
-      return "k_%";
-    }
-
-    return `${namespaceToBaseName(this.namespace)}__k_%`;
+  private currentNamespace(): string {
+    return this.namespace ?? "";
   }
 
   private requireIndexDb(): Database.Database {
@@ -342,10 +295,6 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   }
 
   private async ensureIndexDatabase() {
-    if (!this.opts.useIndexFile) {
-      return;
-    }
-
     if (!this.indexDbReady) {
       this.indexDbReady = this.openIndexDatabase();
     }
@@ -356,119 +305,34 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   private async openIndexDatabase() {
     await this.ensureDirectory();
     const indexPath = this.indexFilePath();
-    const isNewDatabase = !fs.existsSync(indexPath);
     const db = new Database(indexPath);
     this.indexDb = db;
 
     db.pragma("journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS entries (
-        identity TEXT PRIMARY KEY,
+        namespace TEXT NOT NULL,
+        key TEXT NOT NULL,
         file_name TEXT NOT NULL,
-        expires_at INTEGER
+        expires_at INTEGER,
+        PRIMARY KEY(namespace, key)
       );
 
-      CREATE INDEX IF NOT EXISTS idx_entries_expires_at_identity
-      ON entries(expires_at, identity);
+      CREATE INDEX IF NOT EXISTS idx_entries_namespace_expires_at
+      ON entries(namespace, expires_at);
     `);
-
-    if (isNewDatabase) {
-      await this.bootstrapIndexFromDirectory(db);
-    }
-  }
-
-  private async bootstrapIndexFromDirectory(
-    db: Database.Database,
-  ): Promise<void> {
-    await this.ensureDirectory();
-    const now = Date.now();
-    const validEntries = new Map<
-      string,
-      { fileName: string; expiresAt: number | undefined }
-    >();
-
-    for await (const dirent of await fsp.opendir(this.directory)) {
-      if (!dirent.isFile() || dirent.name === INDEX_FILE_NAME) {
-        continue;
-      }
-
-      const parsed = this.parseEntryFileName(dirent.name);
-      if (!parsed) {
-        continue;
-      }
-
-      const fullPath = path.join(this.directory, dirent.name);
-      if (parsed.expiresAt !== undefined && parsed.expiresAt <= now) {
-        await fsp.unlink(fullPath).catch((error) => {
-          if (!isNodeErrno(error) || error.code !== "ENOENT") {
-            throw error;
-          }
-        });
-        continue;
-      }
-
-      const existing = validEntries.get(parsed.identity);
-      if (!existing) {
-        validEntries.set(parsed.identity, {
-          fileName: dirent.name,
-          expiresAt: parsed.expiresAt,
-        });
-        continue;
-      }
-
-      const existingWeight = existing.expiresAt ?? Number.POSITIVE_INFINITY;
-      const parsedWeight = parsed.expiresAt ?? Number.POSITIVE_INFINITY;
-      if (parsedWeight >= existingWeight) {
-        await fsp
-          .unlink(path.join(this.directory, existing.fileName))
-          .catch((error) => {
-            if (!isNodeErrno(error) || error.code !== "ENOENT") {
-              throw error;
-            }
-          });
-        validEntries.set(parsed.identity, {
-          fileName: dirent.name,
-          expiresAt: parsed.expiresAt,
-        });
-      } else {
-        await fsp.unlink(fullPath).catch((error) => {
-          if (!isNodeErrno(error) || error.code !== "ENOENT") {
-            throw error;
-          }
-        });
-      }
-    }
-
-    const clearStmt = db.prepare("DELETE FROM entries");
-    const insertStmt = db.prepare(
-      `INSERT INTO entries(identity, file_name, expires_at) VALUES (?, ?, ?)`,
-    );
-    const tx = db.transaction(() => {
-      clearStmt.run();
-      for (const [identity, entry] of validEntries) {
-        insertStmt.run(identity, entry.fileName, entry.expiresAt ?? null);
-      }
-    });
-    tx();
-
-    this.entryIndex.clear();
-    for (const [identity, entry] of validEntries) {
-      this.entryIndex.set(identity, {
-        fileName: entry.fileName,
-        expiresAt: entry.expiresAt,
-      });
-    }
   }
 
   private indexGet(
-    identity: string,
+    namespace: string,
+    key: string,
   ): { fileName: string; expiresAt: number | undefined } | undefined {
     const db = this.requireIndexDb();
     const row = db
       .prepare(
-        `SELECT file_name as fileName, expires_at as expiresAt FROM entries WHERE identity = ?`,
+        `SELECT file_name as fileName, expires_at as expiresAt FROM entries WHERE namespace = ? AND key = ?`,
       )
-      .get(identity) as
+      .get(namespace, key) as
       | { fileName: string; expiresAt: number | null }
       | undefined;
 
@@ -483,26 +347,30 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   }
 
   private indexUpsert(
-    identity: string,
+    namespace: string,
+    key: string,
     fileName: string,
     expiresAt: number | undefined,
   ) {
     const db = this.requireIndexDb();
     db.prepare(
       `
-      INSERT INTO entries(identity, file_name, expires_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(identity)
+      INSERT INTO entries(namespace, key, file_name, expires_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(namespace, key)
       DO UPDATE SET
         file_name = excluded.file_name,
         expires_at = excluded.expires_at
     `,
-    ).run(identity, fileName, expiresAt ?? null);
+    ).run(namespace, key, fileName, expiresAt ?? null);
   }
 
-  private indexDelete(identity: string) {
+  private indexDelete(namespace: string, key: string) {
     const db = this.requireIndexDb();
-    db.prepare(`DELETE FROM entries WHERE identity = ?`).run(identity);
+    db.prepare(`DELETE FROM entries WHERE namespace = ? AND key = ?`).run(
+      namespace,
+      key,
+    );
   }
 
   private async resolveNextExpireDelay(
@@ -565,153 +433,17 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     await fsp.mkdir(this.directory, { recursive: true });
   }
 
-  private async ensureEntryIndex() {
-    if (this.opts.useIndexFile) {
-      return;
-    }
-
-    if (!this.entryIndexReady) {
-      this.entryIndexReady = this.loadEntryIndex();
-    }
-
-    await this.entryIndexReady;
-  }
-
-  private async loadEntryIndex() {
-    await this.ensureDirectory();
-    this.entryIndex.clear();
-
-    for await (const dirent of await fsp.opendir(this.directory)) {
-      if (!dirent.isFile()) {
-        continue;
-      }
-
-      const parsed = this.parseEntryFileName(dirent.name);
-      if (!parsed) {
-        continue;
-      }
-
-      const existing = this.entryIndex.get(parsed.identity);
-      if (!existing) {
-        this.entryIndex.set(parsed.identity, {
-          fileName: dirent.name,
-          expiresAt: parsed.expiresAt,
-        });
-        continue;
-      }
-
-      const existingWeight = existing.expiresAt ?? Number.POSITIVE_INFINITY;
-      const parsedWeight = parsed.expiresAt ?? Number.POSITIVE_INFINITY;
-      if (parsedWeight >= existingWeight) {
-        this.entryIndex.set(parsed.identity, {
-          fileName: dirent.name,
-          expiresAt: parsed.expiresAt,
-        });
-      }
-    }
-  }
-
-  private entryIdentity(key: string): string {
+  private entryIdentity(namespace: string, key: string): string {
     const namespaceBaseName =
-      this.namespace === undefined
-        ? undefined
-        : namespaceToBaseName(this.namespace);
+      namespace.length === 0 ? undefined : namespaceToBaseName(namespace);
     const keyBaseName = keyToBaseName(key);
     return namespaceBaseName
       ? `${namespaceBaseName}__${keyBaseName}`
       : keyBaseName;
   }
 
-  private fileNameFromIdentity(
-    identity: string,
-    expiresAt: number | undefined,
-  ): string {
-    const token =
-      expiresAt === undefined ? NO_TTL_EXPIRY_TOKEN : String(expiresAt);
-    return `${identity}${EXPIRY_SUFFIX}${token}${this.opts.extension}`;
-  }
-
-  private parseEntryFileName(fileName: string):
-    | {
-        identity: string;
-        key: string;
-        expiresAt: number | undefined;
-      }
-    | undefined {
-    if (!fileName.endsWith(this.opts.extension)) {
-      return;
-    }
-
-    const baseName = fileName.slice(0, -this.opts.extension.length);
-    const suffixIndex = baseName.lastIndexOf(EXPIRY_SUFFIX);
-    if (suffixIndex <= 0) {
-      return;
-    }
-
-    const identity = baseName.slice(0, suffixIndex);
-    const token = baseName.slice(suffixIndex + EXPIRY_SUFFIX.length);
-    const expiresAt = parseExpiryToken(token);
-    if (token !== NO_TTL_EXPIRY_TOKEN && expiresAt === undefined) {
-      return;
-    }
-
-    const key = this.decodeIdentityToKey(identity);
-    if (key === undefined) {
-      return;
-    }
-
-    return {
-      identity,
-      key,
-      expiresAt,
-    };
-  }
-
-  private decodeIdentityToKey(identity: string): string | undefined {
-    if (this.namespace === undefined) {
-      if (identity.startsWith("n_")) {
-        return;
-      }
-
-      return baseNameToKey(identity);
-    }
-
-    const namespaceBaseName = namespaceToBaseName(this.namespace);
-    const namespacedPrefix = `${namespaceBaseName}__`;
-    if (!identity.startsWith(namespacedPrefix)) {
-      return;
-    }
-
-    return baseNameToKey(identity.slice(namespacedPrefix.length));
-  }
-
-  private entryPath(key: string): string {
-    if (this.opts.useIndexFile) {
-      const identity = this.entryIdentity(key);
-      const indexed = this.indexGet(identity);
-      if (!indexed) {
-        return path.join(
-          this.directory,
-          this.fileNameFromIdentity(identity, undefined),
-        );
-      }
-
-      return path.join(this.directory, indexed.fileName);
-    }
-
-    const indexed = this.entryIndex.get(this.entryIdentity(key));
-    if (!indexed) {
-      return path.join(
-        this.directory,
-        this.fileNameFromIdentity(this.entryIdentity(key), undefined),
-      );
-    }
-
-    return path.join(this.directory, indexed.fileName);
-  }
-
-  private decodeFileName(fileName: string): string | undefined {
-    return this.parseEntryFileName(fileName)?.key;
+  private fileNameFromNamespaceAndKey(namespace: string, key: string): string {
+    return `${this.entryIdentity(namespace, key)}${this.opts.extension}`;
   }
 
   private ttlToExpires(ttl?: number): number | undefined {
@@ -750,17 +482,10 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   }
 
   public async get<Value = GetValue>(key: string): Promise<Value | undefined> {
-    const identity = this.entryIdentity(key);
+    const namespace = this.currentNamespace();
+    await this.ensureIndexDatabase();
 
-    if (this.opts.useIndexFile) {
-      await this.ensureIndexDatabase();
-    } else {
-      await this.ensureEntryIndex();
-    }
-
-    const indexed = this.opts.useIndexFile
-      ? this.indexGet(identity)
-      : this.entryIndex.get(identity);
+    const indexed = this.indexGet(namespace, key);
     if (!indexed) {
       return;
     }
@@ -813,11 +538,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     } catch (error) {
       readable.destroy();
       if (isNodeErrno(error) && error.code === "ENOENT") {
-        if (this.opts.useIndexFile) {
-          this.indexDelete(identity);
-        } else {
-          this.entryIndex.delete(identity);
-        }
+        this.indexDelete(namespace, key);
         return;
       }
 
@@ -832,18 +553,12 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   }
 
   public async set(key: string, value: SetValue, ttl?: number): Promise<void> {
-    const identity = this.entryIdentity(key);
-    if (this.opts.useIndexFile) {
-      await this.ensureIndexDatabase();
-    } else {
-      await this.ensureEntryIndex();
-    }
+    const namespace = this.currentNamespace();
+    await this.ensureIndexDatabase();
 
-    const previous = this.opts.useIndexFile
-      ? this.indexGet(identity)
-      : this.entryIndex.get(identity);
+    const previous = this.indexGet(namespace, key);
     const expiresAt = this.ttlToExpires(ttl);
-    const fileName = this.fileNameFromIdentity(identity, expiresAt);
+    const fileName = this.fileNameFromNamespaceAndKey(namespace, key);
     const entry = path.join(this.directory, fileName);
 
     let valueToSerialize = value as unknown;
@@ -853,14 +568,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     }
 
     const payload = await this.opts.serialize(valueToSerialize as SetValue);
-    if (this.opts.useIndexFile) {
-      this.indexUpsert(identity, fileName, expiresAt);
-    } else {
-      this.entryIndex.set(identity, {
-        fileName,
-        expiresAt,
-      });
-    }
+    this.indexUpsert(namespace, key, fileName, expiresAt);
     await this.writeAtomicFromReadable(entry, payload);
 
     if (previous && previous.fileName !== fileName) {
@@ -883,35 +591,21 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   }
 
   public async delete(key: string): Promise<boolean> {
-    const identity = this.entryIdentity(key);
-    if (this.opts.useIndexFile) {
-      await this.ensureIndexDatabase();
-    } else {
-      await this.ensureEntryIndex();
-    }
+    const namespace = this.currentNamespace();
+    await this.ensureIndexDatabase();
 
-    const indexed = this.opts.useIndexFile
-      ? this.indexGet(identity)
-      : this.entryIndex.get(identity);
+    const indexed = this.indexGet(namespace, key);
     if (!indexed) {
       return false;
     }
 
     try {
       await fsp.unlink(path.join(this.directory, indexed.fileName));
-      if (this.opts.useIndexFile) {
-        this.indexDelete(identity);
-      } else {
-        this.entryIndex.delete(identity);
-      }
+      this.indexDelete(namespace, key);
       return true;
     } catch (error) {
       if (isNodeErrno(error) && error.code === "ENOENT") {
-        if (this.opts.useIndexFile) {
-          this.indexDelete(identity);
-        } else {
-          this.entryIndex.delete(identity);
-        }
+        this.indexDelete(namespace, key);
         return false;
       }
 
@@ -926,55 +620,24 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
 
   public async clear(): Promise<void> {
     await this.ensureDirectory();
-    if (this.opts.useIndexFile) {
-      await this.ensureIndexDatabase();
-      const db = this.requireIndexDb();
-      const pattern = this.namespaceIdentityPattern();
-      const rows = db
-        .prepare(
-          `SELECT identity, file_name as fileName FROM entries WHERE identity LIKE ?`,
-        )
-        .all(pattern) as Array<{ identity: string; fileName: string }>;
+    await this.ensureIndexDatabase();
+    const db = this.requireIndexDb();
+    const namespace = this.currentNamespace();
+    const rows = db
+      .prepare(
+        `SELECT key, file_name as fileName FROM entries WHERE namespace = ?`,
+      )
+      .all(namespace) as Array<{ key: string; fileName: string }>;
 
-      for (const row of rows) {
-        await fsp
-          .unlink(path.join(this.directory, row.fileName))
-          .catch((error) => {
-            if (!isNodeErrno(error) || error.code !== "ENOENT") {
-              throw error;
-            }
-          });
-        this.indexDelete(row.identity);
-      }
-
-      return;
-    }
-
-    await this.ensureEntryIndex();
-    const pending: Promise<void>[] = [];
-    for await (const dirent of await fsp.opendir(this.directory)) {
-      if (!dirent.isFile()) {
-        continue;
-      }
-
-      const parsed = this.parseEntryFileName(dirent.name);
-      if (!parsed) {
-        continue;
-      }
-
-      pending.push(
-        fsp.unlink(path.join(this.directory, dirent.name)).then(() => {
-          this.entryIndex.delete(parsed.identity);
-        }),
-      );
-      if (pending.length >= 64) {
-        await Promise.all(pending);
-        pending.length = 0;
-      }
-    }
-
-    if (pending.length > 0) {
-      await Promise.all(pending);
+    for (const row of rows) {
+      await fsp
+        .unlink(path.join(this.directory, row.fileName))
+        .catch((error) => {
+          if (!isNodeErrno(error) || error.code !== "ENOENT") {
+            throw error;
+          }
+        });
+      this.indexDelete(namespace, row.key);
     }
 
     return;
@@ -1007,128 +670,67 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     const startedAt = Date.now();
     this.emit("sweep:start", {
       startedAt,
-      useIndexFile: this.opts.useIndexFile,
+      useIndexFile: true,
       namespace: this.namespace,
     });
 
     try {
-      if (this.opts.useIndexFile) {
-        await this.ensureIndexDatabase();
-        const db = this.requireIndexDb();
-        const now = Date.now();
-        const pattern = this.namespaceIdentityPattern();
-        const totalFiles = (
-          db.prepare(`SELECT COUNT(*) as count FROM entries`).get() as {
-            count: number;
-          }
-        ).count;
-        const namespaceFiles = (
-          db
-            .prepare(
-              `SELECT COUNT(*) as count FROM entries WHERE identity LIKE ?`,
-            )
-            .get(pattern) as { count: number }
-        ).count;
-        let deleted = 0;
-
-        const expiredRows = db
-          .prepare(
-            `
-          SELECT identity, file_name as fileName, expires_at as expiresAt
-          FROM entries
-          WHERE identity LIKE ? AND expires_at IS NOT NULL AND expires_at <= ?
-        `,
-          )
-          .all(pattern, now) as Array<{
-          identity: string;
-          fileName: string;
-          expiresAt: number;
-        }>;
-
-        for (const row of expiredRows) {
-          try {
-            await fsp.unlink(path.join(this.directory, row.fileName));
-            deleted += 1;
-            this.emit("sweep:fileDeleted", {
-              identity: row.identity,
-              key: this.decodeIdentityToKey(row.identity),
-              fileName: row.fileName,
-              expiresAt: row.expiresAt,
-              reason: "expired" as const,
-            });
-          } catch (error) {
-            if (isNodeErrno(error) && error.code === "ENOENT") {
-              continue;
-            }
-
-            throw error;
-          }
-        }
-
-        db.prepare(
-          `
-          DELETE FROM entries
-          WHERE identity LIKE ? AND expires_at IS NOT NULL AND expires_at <= ?
-        `,
-        ).run(pattern, now);
-
-        const stats: ExpireSweepStats = {
-          totalFiles,
-          namespaceFiles,
-          deletedFiles: deleted,
-          durationMs: Date.now() - startedAt,
-        };
-        this.emit("sweep:end", {
-          ...stats,
-          startedAt,
-          endedAt: Date.now(),
-        });
-
-        return stats;
-      }
-
-      await this.ensureDirectory();
-      await this.ensureEntryIndex();
+      await this.ensureIndexDatabase();
+      const db = this.requireIndexDb();
       const now = Date.now();
-      let totalFiles = 0;
-      let namespaceFiles = 0;
+      const namespace = this.currentNamespace();
+      const totalFiles = (
+        db.prepare(`SELECT COUNT(*) as count FROM entries`).get() as {
+          count: number;
+        }
+      ).count;
+      const namespaceFiles = (
+        db
+          .prepare(`SELECT COUNT(*) as count FROM entries WHERE namespace = ?`)
+          .get(namespace) as { count: number }
+      ).count;
       let deleted = 0;
 
-      for await (const dirent of await fsp.opendir(this.directory)) {
-        if (!dirent.isFile()) {
-          continue;
-        }
+      const expiredRows = db
+        .prepare(
+          `
+          SELECT key, file_name as fileName, expires_at as expiresAt
+          FROM entries
+          WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?
+        `,
+        )
+        .all(namespace, now) as Array<{
+        key: string;
+        fileName: string;
+        expiresAt: number;
+      }>;
 
-        totalFiles += 1;
-
-        const parsed = this.parseEntryFileName(dirent.name);
-        if (!parsed) {
-          continue;
-        }
-
-        namespaceFiles += 1;
-
-        if (parsed.expiresAt === undefined || parsed.expiresAt > now) {
-          continue;
-        }
-
+      for (const row of expiredRows) {
         try {
-          await fsp.unlink(path.join(this.directory, dirent.name));
-          this.entryIndex.delete(parsed.identity);
+          await fsp.unlink(path.join(this.directory, row.fileName));
           deleted += 1;
           this.emit("sweep:fileDeleted", {
-            identity: parsed.identity,
-            key: parsed.key,
-            fileName: dirent.name,
-            expiresAt: parsed.expiresAt,
+            identity: this.entryIdentity(namespace, row.key),
+            key: row.key,
+            fileName: row.fileName,
+            expiresAt: row.expiresAt,
             reason: "expired" as const,
           });
         } catch (error) {
-          if (!isNodeErrno(error) || error.code !== "ENOENT") {
-            throw error;
+          if (isNodeErrno(error) && error.code === "ENOENT") {
+            continue;
           }
+
+          throw error;
         }
       }
+
+      db.prepare(
+        `
+          DELETE FROM entries
+          WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?
+        `,
+      ).run(namespace, now);
 
       const stats: ExpireSweepStats = {
         totalFiles,
@@ -1170,48 +772,15 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
   public async *iterator<Value>(
     namespace?: string,
   ): AsyncGenerator<[string, Value], void> {
-    if (this.opts.useIndexFile) {
-      await this.ensureIndexDatabase();
-      const db = this.requireIndexDb();
-      const rows = db
-        .prepare(
-          `SELECT identity FROM entries WHERE identity LIKE ? ORDER BY identity`,
-        )
-        .all(this.namespaceIdentityPattern()) as Array<{ identity: string }>;
+    await this.ensureIndexDatabase();
+    const db = this.requireIndexDb();
+    const currentNamespace = this.currentNamespace();
+    const rows = db
+      .prepare(`SELECT key FROM entries WHERE namespace = ? ORDER BY key`)
+      .all(currentNamespace) as Array<{ key: string }>;
 
-      for (const row of rows) {
-        const key = this.decodeIdentityToKey(row.identity);
-        if (key === undefined) {
-          continue;
-        }
-
-        if (
-          namespace &&
-          !(key === namespace || key.startsWith(`${namespace}:`))
-        ) {
-          continue;
-        }
-
-        const value = await this.get<Value>(key);
-        if (value !== undefined) {
-          yield [key, value];
-        }
-      }
-
-      return;
-    }
-
-    await this.ensureDirectory();
-
-    for await (const dirent of await fsp.opendir(this.directory)) {
-      if (!dirent.isFile()) {
-        continue;
-      }
-
-      const key = this.decodeFileName(dirent.name);
-      if (key === undefined) {
-        continue;
-      }
+    for (const row of rows) {
+      const key = row.key;
 
       if (
         namespace &&
@@ -1225,6 +794,8 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
         yield [key, value];
       }
     }
+
+    return;
   }
 }
 

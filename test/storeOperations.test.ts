@@ -7,10 +7,9 @@ import { keyvDeserialize, keyvSerialize, randomTestPath } from "./helpers.js";
 
 const INDEX_FILE_NAME = ".keyv-filesystem-index.sqlite";
 
-function encodedFileName(key: string, expiresAt: number | "never"): string {
+function encodedFileName(key: string): string {
   const identity = `k_${Buffer.from(key).toString("base64url")}`;
-  const token = expiresAt === "never" ? "never" : String(expiresAt);
-  return `${identity}__exp_${token}.bin`;
+  return `${identity}.bin`;
 }
 
 describe("Store operations", () => {
@@ -229,44 +228,42 @@ describe("Store operations", () => {
       expect(calls.some((stats) => (stats?.deletedFiles ?? 0) >= 1)).toBe(true);
 
       const files = await fsp.readdir(dir);
-      expect(files.length).toBe(0);
+      const entryFiles = files.filter((fileName) => fileName.endsWith(".bin"));
+      expect(entryFiles.length).toBe(0);
     } finally {
       await store.disconnect();
     }
   });
 
-  it("creates sqlite index and bootstraps from existing files", async () => {
+  it("creates empty sqlite index without touching existing files", async () => {
     const dir = randomTestPath("sqlite-index-bootstrap");
     await fsp.mkdir(dir, { recursive: true });
     await fsp.writeFile(
-      path.join(dir, encodedFileName("stale", Date.now() - 1_000)),
+      path.join(dir, encodedFileName("old")),
       Buffer.from("old"),
     );
     await fsp.writeFile(
-      path.join(dir, encodedFileName("alive", Date.now() + 60_000)),
+      path.join(dir, encodedFileName("new")),
       Buffer.from("new"),
     );
 
     const store = new KeyvFilesystem({
       path: dir,
-      useIndexFile: true,
       expiredCheckDelay: 60_000,
     });
 
     try {
-      const startedAt = Date.now();
-      while (Date.now() - startedAt < 2_000) {
-        if ((await store.get<Buffer>("stale")) === undefined) {
-          break;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      }
-
-      expect(await store.get("stale")).toBeUndefined();
-      expect((await store.get<Buffer>("alive"))?.toString()).toBe("new");
+      expect(await store.get<Buffer>("old")).toBeUndefined();
+      expect(await store.get<Buffer>("new")).toBeUndefined();
       await expect(
         fsp.stat(path.join(dir, INDEX_FILE_NAME)),
+      ).resolves.toBeTruthy();
+
+      await expect(
+        fsp.stat(path.join(dir, encodedFileName("old"))),
+      ).resolves.toBeTruthy();
+      await expect(
+        fsp.stat(path.join(dir, encodedFileName("new"))),
       ).resolves.toBeTruthy();
     } finally {
       await store.disconnect();
@@ -277,7 +274,6 @@ describe("Store operations", () => {
     const dir = randomTestPath("sqlite-index-sweep");
     const store = new KeyvFilesystem({
       path: dir,
-      useIndexFile: true,
       expiredCheckDelay: 60_000,
     });
 
