@@ -104,11 +104,13 @@ export type KeyvFilesystemOptions<
   path: string;
 } & Partial<Omit<Options<SetValue, GetValue>, "path">>;
 
-type InternalOptions<SetValue = DefaultSetValue, GetValue = Buffer> =
-  Options<SetValue, GetValue> & {
-    /** Keyv adapter dialect hint used by Keyv internals. */
-    dialect: string;
-  };
+type InternalOptions<SetValue = DefaultSetValue, GetValue = Buffer> = Options<
+  SetValue,
+  GetValue
+> & {
+  /** Keyv adapter dialect hint used by Keyv internals. */
+  dialect: string;
+};
 
 function isNodeReadable(value: unknown): value is Readable {
   return value instanceof Readable;
