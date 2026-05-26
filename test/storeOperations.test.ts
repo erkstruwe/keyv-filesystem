@@ -1,16 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import { promises as fsp } from "fs";
 import path from "path";
+import Database from "better-sqlite3";
 import Keyv from "keyv";
 import KeyvFilesystem from "../src/index.ts";
 import { keyvDeserialize, keyvSerialize, randomTestPath } from "./helpers.js";
 
 const INDEX_FILE_NAME = ".keyv-filesystem-index.sqlite";
-
-function encodedFileName(key: string): string {
-  const identity = `k_${Buffer.from(key).toString("base64url")}`;
-  return `${identity}.bin`;
-}
 
 describe("Store operations", () => {
   it("sets ttl metadata before rename and avoids post-rename utimes", async () => {
@@ -237,15 +233,11 @@ describe("Store operations", () => {
 
   it("creates empty sqlite index without touching existing files", async () => {
     const dir = randomTestPath("sqlite-index-bootstrap");
+    const legacyOldFileName = "old-existing.bin";
+    const legacyNewFileName = "new-existing.bin";
     await fsp.mkdir(dir, { recursive: true });
-    await fsp.writeFile(
-      path.join(dir, encodedFileName("old")),
-      Buffer.from("old"),
-    );
-    await fsp.writeFile(
-      path.join(dir, encodedFileName("new")),
-      Buffer.from("new"),
-    );
+    await fsp.writeFile(path.join(dir, legacyOldFileName), Buffer.from("old"));
+    await fsp.writeFile(path.join(dir, legacyNewFileName), Buffer.from("new"));
 
     const store = new KeyvFilesystem({
       path: dir,
@@ -260,10 +252,44 @@ describe("Store operations", () => {
       ).resolves.toBeTruthy();
 
       await expect(
-        fsp.stat(path.join(dir, encodedFileName("old"))),
+        fsp.stat(path.join(dir, legacyOldFileName)),
       ).resolves.toBeTruthy();
       await expect(
-        fsp.stat(path.join(dir, encodedFileName("new"))),
+        fsp.stat(path.join(dir, legacyNewFileName)),
+      ).resolves.toBeTruthy();
+    } finally {
+      await store.disconnect();
+    }
+  });
+
+  it("stores UUIDv3 id in sqlite and uses id as filename", async () => {
+    const dir = randomTestPath("sqlite-uuid-id");
+    const store = new KeyvFilesystem({
+      path: dir,
+      expiredCheckDelay: 60_000,
+    });
+
+    try {
+      await store.set("uuid-key", Buffer.from("value"));
+
+      const db = new Database(path.join(dir, INDEX_FILE_NAME), {
+        readonly: true,
+      });
+      const row = db
+        .prepare(
+          `SELECT id, file_name as fileName FROM entries WHERE namespace = '' AND key = ?`,
+        )
+        .get("uuid-key") as { id: string; fileName: string } | undefined;
+      db.close();
+
+      expect(row).toBeDefined();
+      expect(row?.id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-3[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(row?.fileName).toBe(`${row?.id}.bin`);
+
+      await expect(
+        fsp.stat(path.join(dir, row?.fileName ?? "")),
       ).resolves.toBeTruthy();
     } finally {
       await store.disconnect();

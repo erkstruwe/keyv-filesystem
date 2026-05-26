@@ -10,14 +10,6 @@ Filesystem storage adapter for Keyv, optimized for binary files on disk with one
 npm install --save keyv keyv-filesystem
 ```
 
-## Runtime Dependencies
-
-This package currently depends on:
-
-- `better-sqlite3`
-
-Development dependencies are used only for building, testing, and formatting.
-
 ## Usage
 
 `path` is required when creating `KeyvFilesystem`.
@@ -31,6 +23,7 @@ const keyv = new Keyv({
   store: new KeyvFilesystem({
     path: "./node_modules/.cache/keyv-filesystem",
   }),
+  useKeyPrefix: false,
   serialize: undefined,
   deserialize: undefined,
 });
@@ -57,6 +50,7 @@ const keyv = new Keyv({
   store: new KeyvFilesystem({
     path: "./node_modules/.cache/keyv-filesystem",
   }),
+  useKeyPrefix: false,
   serialize: undefined,
   deserialize: undefined,
 });

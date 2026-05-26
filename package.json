@@ -38,7 +38,8 @@
     "node": ">=16.8.0"
   },
   "dependencies": {
-    "better-sqlite3": "^11.8.1"
+    "better-sqlite3": "^11.8.1",
+    "uuid": "^14.0.0"
   },
   "devDependencies": {
     "@keyv/serialize": "^1.1.1",

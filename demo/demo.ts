@@ -11,6 +11,7 @@ const cache = new Keyv({
   store: new KeyvFilesystem({
     path: "./node_modules/.cache/keyv-filesystem-demo",
   }),
+  useKeyPrefix: false,
   serialize: undefined,
   deserialize: undefined,
 });

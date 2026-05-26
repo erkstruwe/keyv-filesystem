@@ -8,6 +8,7 @@ import { pipeline } from "stream/promises";
 import { ReadableStream as WebReadableStream } from "stream/web";
 import Database from "better-sqlite3";
 import type { KeyvStoreAdapter } from "keyv";
+import { v3 as uuidv3 } from "uuid";
 
 export type DefaultSetValue = Buffer | Readable | WebReadableStream;
 
@@ -38,6 +39,7 @@ export type ExpiredCheckDelayResolver = (
 const MIN_DEFAULT_EXPIRE_SWEEP_DELAY = 60_000;
 const INDEX_FILE_NAME = ".keyv-filesystem-index.sqlite";
 const ADAPTER_DIALECT = "redis";
+const ENTRY_ID_NAMESPACE = "d2c299cf-6a4e-48c0-b5f0-f610db4c0e56";
 
 function defaultExpiredCheckDelay(
   lastSweep: ExpireSweepStats | undefined,
@@ -189,12 +191,8 @@ function toBufferChunk(chunk: unknown): Buffer {
   );
 }
 
-function keyToBaseName(key: string): string {
-  return `k_${Buffer.from(key).toString("base64url")}`;
-}
-
-function namespaceToBaseName(namespace: string): string {
-  return `n_${Buffer.from(namespace).toString("base64url")}`;
+function entryIdFromNamespaceAndKey(namespace: string, key: string): string {
+  return uuidv3(`${namespace}\0${key}`, ENTRY_ID_NAMESPACE);
 }
 
 async function fsyncFile(filePath: string) {
@@ -311,6 +309,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     db.pragma("journal_mode = WAL");
     db.exec(`
       CREATE TABLE IF NOT EXISTS entries (
+        id TEXT,
         namespace TEXT NOT NULL,
         key TEXT NOT NULL,
         file_name TEXT NOT NULL,
@@ -321,19 +320,46 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
       CREATE INDEX IF NOT EXISTS idx_entries_namespace_expires_at
       ON entries(namespace, expires_at);
     `);
+
+    const tableColumns = db
+      .prepare(`PRAGMA table_info(entries)`)
+      .all() as Array<{ name: string }>;
+    const hasIdColumn = tableColumns.some((column) => column.name === "id");
+    if (!hasIdColumn) {
+      db.exec(`ALTER TABLE entries ADD COLUMN id TEXT`);
+    }
+
+    const rowsMissingIds = db
+      .prepare(`SELECT namespace, key FROM entries WHERE id IS NULL OR id = ''`)
+      .all() as Array<{ namespace: string; key: string }>;
+    if (rowsMissingIds.length > 0) {
+      const backfillIdStatement = db.prepare(
+        `UPDATE entries SET id = ? WHERE namespace = ? AND key = ?`,
+      );
+      const transaction = db.transaction(
+        (rows: Array<{ namespace: string; key: string }>) => {
+          for (const row of rows) {
+            backfillIdStatement.run(randomUUID(), row.namespace, row.key);
+          }
+        },
+      );
+      transaction(rowsMissingIds);
+    }
   }
 
   private indexGet(
     namespace: string,
     key: string,
-  ): { fileName: string; expiresAt: number | undefined } | undefined {
+  ):
+    | { id: string; fileName: string; expiresAt: number | undefined }
+    | undefined {
     const db = this.requireIndexDb();
     const row = db
       .prepare(
-        `SELECT file_name as fileName, expires_at as expiresAt FROM entries WHERE namespace = ? AND key = ?`,
+        `SELECT id, file_name as fileName, expires_at as expiresAt FROM entries WHERE namespace = ? AND key = ?`,
       )
       .get(namespace, key) as
-      | { fileName: string; expiresAt: number | null }
+      | { id: string | null; fileName: string; expiresAt: number | null }
       | undefined;
 
     if (!row) {
@@ -341,12 +367,14 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     }
 
     return {
+      id: row.id ?? "",
       fileName: row.fileName,
       expiresAt: row.expiresAt === null ? undefined : row.expiresAt,
     };
   }
 
   private indexUpsert(
+    id: string,
     namespace: string,
     key: string,
     fileName: string,
@@ -355,14 +383,15 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     const db = this.requireIndexDb();
     db.prepare(
       `
-      INSERT INTO entries(namespace, key, file_name, expires_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO entries(id, namespace, key, file_name, expires_at)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT(namespace, key)
       DO UPDATE SET
+        id = excluded.id,
         file_name = excluded.file_name,
         expires_at = excluded.expires_at
     `,
-    ).run(namespace, key, fileName, expiresAt ?? null);
+    ).run(id, namespace, key, fileName, expiresAt ?? null);
   }
 
   private indexDelete(namespace: string, key: string) {
@@ -433,17 +462,8 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     await fsp.mkdir(this.directory, { recursive: true });
   }
 
-  private entryIdentity(namespace: string, key: string): string {
-    const namespaceBaseName =
-      namespace.length === 0 ? undefined : namespaceToBaseName(namespace);
-    const keyBaseName = keyToBaseName(key);
-    return namespaceBaseName
-      ? `${namespaceBaseName}__${keyBaseName}`
-      : keyBaseName;
-  }
-
-  private fileNameFromNamespaceAndKey(namespace: string, key: string): string {
-    return `${this.entryIdentity(namespace, key)}${this.opts.extension}`;
+  private fileNameFromId(id: string): string {
+    return `${id}${this.opts.extension}`;
   }
 
   private ttlToExpires(ttl?: number): number | undefined {
@@ -558,7 +578,8 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
 
     const previous = this.indexGet(namespace, key);
     const expiresAt = this.ttlToExpires(ttl);
-    const fileName = this.fileNameFromNamespaceAndKey(namespace, key);
+    const id = entryIdFromNamespaceAndKey(namespace, key);
+    const fileName = this.fileNameFromId(id);
     const entry = path.join(this.directory, fileName);
 
     let valueToSerialize = value as unknown;
@@ -568,7 +589,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
     }
 
     const payload = await this.opts.serialize(valueToSerialize as SetValue);
-    this.indexUpsert(namespace, key, fileName, expiresAt);
+    this.indexUpsert(id, namespace, key, fileName, expiresAt);
     await this.writeAtomicFromReadable(entry, payload);
 
     if (previous && previous.fileName !== fileName) {
@@ -694,12 +715,13 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
       const expiredRows = db
         .prepare(
           `
-          SELECT key, file_name as fileName, expires_at as expiresAt
+          SELECT id, key, file_name as fileName, expires_at as expiresAt
           FROM entries
           WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?
         `,
         )
         .all(namespace, now) as Array<{
+        id: string | null;
         key: string;
         fileName: string;
         expiresAt: number;
@@ -710,7 +732,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
           await fsp.unlink(path.join(this.directory, row.fileName));
           deleted += 1;
           this.emit("sweep:fileDeleted", {
-            identity: this.entryIdentity(namespace, row.key),
+            identity: row.id ?? row.fileName,
             key: row.key,
             fileName: row.fileName,
             expiresAt: row.expiresAt,
