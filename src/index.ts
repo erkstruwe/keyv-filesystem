@@ -39,6 +39,7 @@ const MIN_DEFAULT_EXPIRE_SWEEP_DELAY = 60_000;
 const EXPIRY_SUFFIX = "__exp_";
 const NO_TTL_EXPIRY_TOKEN = "never";
 const INDEX_FILE_NAME = ".keyv-filesystem-index.sqlite";
+const ADAPTER_DIALECT = "redis";
 
 function defaultExpiredCheckDelay(
   lastSweep: ExpireSweepStats | undefined,
@@ -72,8 +73,6 @@ function defaultExpiredCheckDelay(
 }
 
 export interface Options<SetValue = DefaultSetValue, GetValue = Buffer> {
-  /** Keyv adapter dialect hint used by Keyv internals. */
-  dialect: string;
   /** Directory used for one-file-per-entry storage. */
   path: string;
   /**
@@ -104,6 +103,12 @@ export type KeyvFilesystemOptions<
 > = {
   path: string;
 } & Partial<Omit<Options<SetValue, GetValue>, "path">>;
+
+type InternalOptions<SetValue = DefaultSetValue, GetValue = Buffer> =
+  Options<SetValue, GetValue> & {
+    /** Keyv adapter dialect hint used by Keyv internals. */
+    dialect: string;
+  };
 
 function isNodeReadable(value: unknown): value is Readable {
   return value instanceof Readable;
@@ -149,7 +154,6 @@ async function defaultReadableDeserializer(stream: Readable): Promise<Buffer> {
 }
 
 export const defaultOpts: Omit<Options<DefaultSetValue, Buffer>, "path"> = {
-  dialect: "redis",
   expiredCheckDelay: defaultExpiredCheckDelay,
   extension: ".bin",
   useIndexFile: false,
@@ -263,7 +267,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
 
   public namespace?: string;
 
-  public readonly opts: Options<SetValue, GetValue>;
+  public readonly opts: InternalOptions<SetValue, GetValue>;
 
   private readonly directory: string;
 
@@ -305,6 +309,7 @@ export class KeyvFilesystem<SetValue = DefaultSetValue, GetValue = Buffer>
         options.deserialize ??
         (defaultReadableDeserializer as Deserializer<GetValue>),
       path: this.directory,
+      dialect: ADAPTER_DIALECT,
     };
 
     this.ensureDirectory().catch((error) => this.emit("error", error));

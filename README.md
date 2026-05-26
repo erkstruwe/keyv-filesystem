@@ -31,6 +31,8 @@ const keyv = new Keyv({
   store: new KeyvFilesystem({
     path: "./node_modules/.cache/keyv-filesystem",
   }),
+  serialize: undefined,
+  deserialize: undefined,
 });
 
 const fileBuffer = await readFile("./assets/image.bin");
@@ -38,9 +40,13 @@ await keyv.set("image", fileBuffer);
 const value = await keyv.get("image");
 ```
 
-### Using Readable Values Through Keyv
+> [!IMPORTANT]
+> Set `serialize` and `deserialize` to `undefined` when using `keyv-filesystem` via `Keyv`.
+> Otherwise, Keyv's default JSON serialization runs first and the adapter will not receive the original binary/stream payload.
 
-If you want to store Node `Readable` or Web `ReadableStream` values through `Keyv`, disable Keyv-level serialization so the adapter receives the original stream payload.
+### Using Adapter Serialization Through Keyv
+
+If you want this adapter's serializer/deserializer behavior (for `Buffer`, Node `Readable`, or Web `ReadableStream`) through `Keyv`, disable Keyv-level serialization so the adapter receives the original payload.
 
 ```js
 import Keyv from "keyv";
@@ -71,7 +77,7 @@ try {
 }
 ```
 
-Why: Keyv's default serializer converts values to JSON-compatible data. For stream objects, this stores stream metadata instead of streamed bytes. With `serialize`/`deserialize` set to `undefined`, `keyv-filesystem` writes the actual stream content.
+Why: Keyv's default serializer converts values to JSON-compatible data before they reach the store adapter. That means original stream bytes are no longer available to the adapter. With `serialize`/`deserialize` set to `undefined`, `keyv-filesystem` receives the original value and can write the intended bytes.
 
 ### Default Serializer Input Types
 
@@ -131,6 +137,7 @@ const user = await store.get("user:1"); // typed as UserProfile | undefined
 ## How It Works
 
 - One file per key under `path`.
+- File names are encoded identities (namespace + key + expiry token), not raw key strings.
 - Expiration time is encoded in the entry filename as a suffix token.
 - Non-expiring values use the special filename token `never`.
 - Expired values are deleted on read and by periodic sweep (`expiredCheckDelay`).
@@ -149,7 +156,6 @@ const user = await store.get("user:1"); // typed as UserProfile | undefined
 - `serialize` (default serializer): `(Buffer | Readable | ReadableStream) -> Readable`.
 - `deserialize` (default deserializer): `Readable -> Buffer`.
 - `durability` (default `standard`): write durability strategy.
-- `dialect` (default `redis`): Keyv compatibility hint for iterable adapter detection.
 
 ### Durability Modes
 
@@ -169,7 +175,6 @@ For most workloads, `standard` is enough. Use `strict` when durability is more i
 
 ```js
 {
-  dialect: 'redis',
   expiredCheckDelay: (lastSweep) => number,
   extension: '.bin',
   useIndexFile: false,
